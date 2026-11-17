@@ -1,8 +1,73 @@
+diff --git a/app/src/main/java/sh/hnet/comfychair/MainContainerActivity.kt b/app/src/main/java/sh/hnet/comfychair/MainContainerActivity.kt
+index 492de7f..9e11a93 100644
+--- a/app/src/main/java/sh/hnet/comfychair/MainContainerActivity.kt
++++ b/app/src/main/java/sh/hnet/comfychair/MainContainerActivity.kt
+@@ -47,6 +47,7 @@ import sh.hnet.comfychair.viewmodel.SettingsViewModel
+ import sh.hnet.comfychair.viewmodel.TextToImageViewModel
+ import sh.hnet.comfychair.viewmodel.TextToVideoViewModel
+ import sh.hnet.comfychair.viewmodel.VideoToVideoViewModel
++import sh.hnet.comfychair.viewmodel.ReferenceToVideoViewModel
+ import sh.hnet.comfychair.viewmodel.WorkflowManagementViewModel
+ 
+ /**
+@@ -68,6 +69,7 @@ class MainContainerActivity : ComponentActivity() {
+     private val textToVideoViewModel: TextToVideoViewModel by viewModels()
+     private val imageToVideoViewModel: ImageToVideoViewModel by viewModels()
+     private val videoToVideoViewModel: VideoToVideoViewModel by viewModels()
++    private val referenceToVideoViewModel: ReferenceToVideoViewModel by viewModels()
+     private val galleryViewModel: GalleryViewModel by viewModels()
+     private val mediaViewerViewModel: MediaViewerViewModel by viewModels()
+     private val settingsViewModel: SettingsViewModel by viewModels()
+@@ -161,6 +163,7 @@ class MainContainerActivity : ComponentActivity() {
+             TextToVideoViewModel.OWNER_ID -> MainRoute.TextToVideo.route
+             ImageToVideoViewModel.OWNER_ID -> MainRoute.ImageToVideo.route
+             VideoToVideoViewModel.OWNER_ID -> MainRoute.VideoToVideo.route
++            ReferenceToVideoViewModel.OWNER_ID -> MainRoute.ReferenceToVideo.route
+             else -> MainRoute.TextToImage.route
+         }
+ 
+@@ -175,7 +178,7 @@ class MainContainerActivity : ComponentActivity() {
+                 // Settings changes reach the screens in place (workflows by themselves, through WorkflowManager);
+                 // only offline mode, a change of the connection, restarts when leaving the Settings tab
+                 LaunchedEffect(Unit) {
+-                    val screens = listOf(textToImageViewModel, imageToImageViewModel, textToVideoViewModel, imageToVideoViewModel, videoToVideoViewModel)
++                    val screens = listOf(textToImageViewModel, imageToImageViewModel, textToVideoViewModel, imageToVideoViewModel, videoToVideoViewModel, referenceToVideoViewModel)
+                     settingsViewModel.events.collect { event ->
+                         when (event) {
+                             is SettingsEvent.SavedStateChanged -> screens.forEach { it.reloadSavedState() }
+@@ -199,6 +202,7 @@ class MainContainerActivity : ComponentActivity() {
+                         textToVideoViewModel = textToVideoViewModel,
+                         imageToVideoViewModel = imageToVideoViewModel,
+                         videoToVideoViewModel = videoToVideoViewModel,
++                        referenceToVideoViewModel = referenceToVideoViewModel,
+                         galleryViewModel = galleryViewModel,
+                         mediaViewerViewModel = mediaViewerViewModel,
+                         settingsViewModel = settingsViewModel,
 diff --git a/app/src/main/java/sh/hnet/comfychair/WorkflowManager.kt b/app/src/main/java/sh/hnet/comfychair/WorkflowManager.kt
-index 9c60053..3271c0c 100644
+index 9c60053..b473eea 100644
 --- a/app/src/main/java/sh/hnet/comfychair/WorkflowManager.kt
 +++ b/app/src/main/java/sh/hnet/comfychair/WorkflowManager.kt
-@@ -624,10 +624,12 @@ object WorkflowManager {
+@@ -39,7 +39,8 @@ enum class WorkflowType {
+     ITI_EDITING,      // Image-to-Image Editing
+     TTV,              // Text-to-Video
+     ITV,              // Image-to-Video
+-    V2V               // Video-to-Video
++    V2V,              // Video-to-Video
++    R2V               // Reference-to-Video (MiniMax H3 ref2va: images, videos, audio as references)
+ }
+ 
+ /**
+@@ -57,7 +58,8 @@ object WorkflowTypeDisplay {
+         WorkflowType.ITI_EDITING to R.string.workflow_section_iti_editing,
+         WorkflowType.TTV to R.string.workflow_section_ttv,
+         WorkflowType.ITV to R.string.workflow_section_itv,
+-        WorkflowType.V2V to R.string.workflow_section_v2v
++        WorkflowType.V2V to R.string.workflow_section_v2v,
++        WorkflowType.R2V to R.string.workflow_section_r2v
+     )
+ 
+     /**
+@@ -624,10 +626,12 @@ object WorkflowManager {
          val placeholder = "{{${TemplateKeyRegistry.getPlaceholderForKey(fieldKey)}}}"
          val (classType, inputKey) = placeholderInputIndex(workflow.jsonContent)[placeholder] ?: return null
          // Node definitions are looked up on each call: the registry may be loaded after the index was built
@@ -19,7 +84,38 @@ index 9c60053..3271c0c 100644
      }
  
      /** Placeholder index per workflow JSON; screens query it for many fields right after loading a workflow. */
-@@ -1841,9 +1843,56 @@ object WorkflowManager {
+@@ -1744,9 +1748,20 @@ object WorkflowManager {
+         val reference1: String? = null,
+         val reference2: String? = null,
+         /** The uploaded source video (Video to Video) */
+-        val video: String? = null
++        val video: String? = null,
++        /** The uploaded references of Reference to Video, in the order they are presented to the model */
++        val references: List<WorkflowReference> = emptyList()
+     )
+ 
++    /** What a reference is: MiniMax H3 takes up to 9 images, 3 videos and 3 standalone audio clips. */
++    enum class ReferenceKind { IMAGE, VIDEO, AUDIO }
++
++    /**
++     * A reference of Reference to Video: its kind, its file in the server's input folder, and for a video whether its
++     * soundtrack is passed on too (it then takes an <Audio N> tag, numbered before the standalone audio).
++     */
++    data class WorkflowReference(val kind: ReferenceKind, val filename: String, val withSound: Boolean = false)
++
+     /**
+      * Prepare a workflow for submission: every placeholder filled from [params] (prompts, all model
+      * selections, all parameters), uploaded [images] referenced, unused reference image nodes removed,
+@@ -1828,6 +1843,8 @@ object WorkflowManager {
+         // From here on the nodes that run: subgraphs flattened, their values back inside
+         json = Subgraphs.flattenJson(json)
+         json = removeUnusedReferenceImages(json, images)
++        // Reference to Video: the references chosen on the screen wired into MiniMax H3's reference node
++        if (workflow.type == WorkflowType.R2V) json = injectReferences(json, images.references)
+         json = applyBypassedNodes(json)
+ 
+         // LoRA chains: the main chain after the model loader, the high/low noise chains after a
+@@ -1841,9 +1858,142 @@ object WorkflowManager {
          if (params.lownoiseLoraChain.isNotEmpty()) {
              json = injectAdditionalVideoLoras(json, params.lownoiseLoraChain, isHighNoise = false)
          }
@@ -73,15 +169,1021 @@ index 9c60053..3271c0c 100644
 +        }
 +    }
 +
++    /** The reference groups of MiniMaxH3ReferenceToVideo (ComfyUI core), as an API prompt keys them: "group.slot". */
++    private val REFERENCE_GROUPS = listOf("ref_images", "ref_videos", "ref_video_audios", "ref_audios")
++    private val REFERENCE_SLOT_PREFIXES = listOf("ref_image_", "ref_video_", "ref_video_audio_", "ref_audio_")
++
++    /** Longest part of a reference video that is read: MiniMax H3 takes 2-15 s of a reference video. */
++    private const val REFERENCE_VIDEO_SECONDS = 15.0
++
++    /**
++     * Wire [references] into every MiniMaxH3ReferenceToVideo node, in place of the references the workflow came with:
++     * - an image: LoadImage -> ref_images.ref_image_N
++     * - a video: LoadVideo -> Video Slice (first 15 s) -> GetVideoComponents; its frames -> ref_videos.ref_video_N and,
++     *   with its sound, its audio -> ref_video_audios.ref_video_audio_N (paired by number, as the node pairs them)
++     * - an audio clip: LoadAudio -> ref_audios.ref_audio_N
++     * Slots count from 0 within each kind; the node presents images, then videos (each soundtrack before its video),
++     * then standalone audio, which is how the screen numbers the <Picture N>, <Video N> and <Audio N> tags.
++     * The workflow's former reference loaders stay, unconnected, and so don't run.
++     */
++    private fun injectReferences(processedJson: String, references: List<WorkflowReference>): String {
++        return try {
++            val root = JSONObject(processedJson)
++            val nodes = root.optJSONObject("nodes") ?: root
++            val targets = nodes.keys().asSequence()
++                .filter { WorkflowJsonAnalyzer.isReferenceToVideoNode(nodes.optJSONObject(it)?.optString("class_type") ?: "") }
++                .toList()
++            if (targets.isEmpty()) {
++                DebugLogger.w(TAG, "Reference to Video: no MiniMaxH3ReferenceToVideo node in the workflow")
++                return processedJson
++            }
++
++            fun link(nodeId: String, output: Int) = JSONArray().put(nodeId).put(output)
++            fun node(classType: String, inputs: JSONObject) = JSONObject().put("class_type", classType).put("inputs", inputs)
++
++            val wiring = linkedMapOf<String, JSONArray>()
++            var images = 0
++            var videos = 0
++            var audios = 0
++            for (ref in references) {
++                when (ref.kind) {
++                    ReferenceKind.IMAGE -> {
++                        val id = "r2v_image_$images"
++                        nodes.put(id, node("LoadImage", JSONObject().put("image", ref.filename)))
++                        wiring["ref_images.ref_image_$images"] = link(id, 0)
++                        images++
++                    }
++                    ReferenceKind.VIDEO -> {
++                        val load = "r2v_video_$videos"
++                        val slice = "r2v_video_slice_$videos"
++                        val parts = "r2v_video_parts_$videos"
++                        nodes.put(load, node("LoadVideo", JSONObject().put("file", ref.filename)))
++                        nodes.put(slice, node("Video Slice", JSONObject()
++                            .put("video", link(load, 0))
++                            .put("start_time", 0.0)
++                            .put("duration", REFERENCE_VIDEO_SECONDS)
++                            .put("strict_duration", false)))
++                        nodes.put(parts, node("GetVideoComponents", JSONObject().put("video", link(slice, 0))))
++                        wiring["ref_videos.ref_video_$videos"] = link(parts, 0)
++                        if (ref.withSound) wiring["ref_video_audios.ref_video_audio_$videos"] = link(parts, 1)
++                        videos++
++                    }
++                    ReferenceKind.AUDIO -> {
++                        val id = "r2v_audio_$audios"
++                        nodes.put(id, node("LoadAudio", JSONObject().put("audio", ref.filename)))
++                        wiring["ref_audios.ref_audio_$audios"] = link(id, 0)
++                        audios++
++                    }
++                }
++            }
++
++            for (target in targets) {
++                val inputs = nodes.optJSONObject(target)?.optJSONObject("inputs") ?: continue
++                // The workflow's own references give way to the chosen ones
++                inputs.keys().asSequence()
++                    .filter { key -> REFERENCE_GROUPS.any { key.startsWith("$it.") } || REFERENCE_SLOT_PREFIXES.any { key.startsWith(it) } }
++                    .toList()
++                    .forEach { inputs.remove(it) }
++                wiring.forEach { (key, source) -> inputs.put(key, source) }
++            }
++            DebugLogger.i(TAG, "Reference to Video: $images image(s), $videos video(s), $audios audio clip(s) wired " +
++                "into ${targets.size} node(s)")
++            root.toString()
++        } catch (e: Exception) {
++            DebugLogger.e(TAG, "Reference to Video: references not wired: ${Obfuscator.error(e)}")
++            processedJson
++        }
++    }
++
      /**
       * Remove reference image nodes (LoadImage with a reference image placeholder) that got no image,
       * together with the inputs connected to them, so the workflow runs without the optional references.
+diff --git a/app/src/main/java/sh/hnet/comfychair/cache/MediaStateHolder.kt b/app/src/main/java/sh/hnet/comfychair/cache/MediaStateHolder.kt
+index 524b31b..2628179 100644
+--- a/app/src/main/java/sh/hnet/comfychair/cache/MediaStateHolder.kt
++++ b/app/src/main/java/sh/hnet/comfychair/cache/MediaStateHolder.kt
+@@ -60,6 +60,7 @@ object MediaStateHolder {
+         data object TtvPreview : MediaKey("ttv_last_preview.png")
+         data object ItvPreview : MediaKey("itv_last_preview.png")
+         data object V2vPreview : MediaKey("v2v_last_preview.png")
++        data object R2vPreview : MediaKey("r2v_last_preview.png")
+ 
+         // Source images (user-selected images for Image-to-X workflows)
+         data object ItiSource : MediaKey("iti_last_source.png")
+@@ -76,6 +77,7 @@ object MediaStateHolder {
+         data class TtvVideo(val promptId: String) : MediaKey("${VideoUtils.FilePrefix.TEXT_TO_VIDEO}$promptId.mp4")
+         data class ItvVideo(val promptId: String) : MediaKey("${VideoUtils.FilePrefix.IMAGE_TO_VIDEO}$promptId.mp4")
+         data class V2vVideo(val promptId: String) : MediaKey("${VideoUtils.FilePrefix.VIDEO_TO_VIDEO}$promptId.mp4")
++        data class R2vVideo(val promptId: String) : MediaKey("${VideoUtils.FilePrefix.REFERENCE_TO_VIDEO}$promptId.mp4")
+ 
+         /**
+          * Get the full filename including server ID prefix.
+@@ -88,6 +90,7 @@ object MediaStateHolder {
+                 is TtvVideo -> "${VideoUtils.FilePrefix.TEXT_TO_VIDEO}${Obfuscator.promptId(promptId)}"
+                 is ItvVideo -> "${VideoUtils.FilePrefix.IMAGE_TO_VIDEO}${Obfuscator.promptId(promptId)}"
+                 is V2vVideo -> "${VideoUtils.FilePrefix.VIDEO_TO_VIDEO}${Obfuscator.promptId(promptId)}"
++                is R2vVideo -> "${VideoUtils.FilePrefix.REFERENCE_TO_VIDEO}${Obfuscator.promptId(promptId)}"
+                 else -> baseFilename
+             }
+     }
+@@ -127,6 +130,8 @@ object MediaStateHolder {
+     private var currentItvPromptId: String? = null
+     @Volatile
+     private var currentV2vPromptId: String? = null
++    @Volatile
++    private var currentR2vPromptId: String? = null
+ 
+     // Serializes everything that reads, writes or deletes media files, so a background persist
+     // never overlaps a load, a mode switch or the memory-only cleanup
+@@ -312,6 +317,7 @@ object MediaStateHolder {
+             MediaKey.ItvSource,
+             MediaKey.V2vPreview,
+             MediaKey.V2vSource,
++            MediaKey.R2vPreview,
+             MediaKey.IteReferenceImage1,
+             MediaKey.IteReferenceImage2
+         )
+@@ -335,6 +341,7 @@ object MediaStateHolder {
+                     file.name.contains(VideoUtils.FilePrefix.TEXT_TO_VIDEO) ||
+                     file.name.contains(VideoUtils.FilePrefix.IMAGE_TO_VIDEO) ||
+                     file.name.contains(VideoUtils.FilePrefix.VIDEO_TO_VIDEO) ||
++                    file.name.contains(VideoUtils.FilePrefix.REFERENCE_TO_VIDEO) ||
+                     file.name.endsWith(OUTPUTS_FILE_SUFFIX)
+                 )
+             }?.forEach { file ->
+@@ -432,6 +439,7 @@ object MediaStateHolder {
+             is MediaKey.TtvVideo -> currentTtvPromptId = key.promptId
+             is MediaKey.ItvVideo -> currentItvPromptId = key.promptId
+             is MediaKey.V2vVideo -> currentV2vPromptId = key.promptId
++            is MediaKey.R2vVideo -> currentR2vPromptId = key.promptId
+             else -> { }
+         }
+ 
+@@ -441,6 +449,7 @@ object MediaStateHolder {
+             is MediaKey.TtvVideo -> VideoUtils.FilePrefix.TEXT_TO_VIDEO
+             is MediaKey.ItvVideo -> VideoUtils.FilePrefix.IMAGE_TO_VIDEO
+             is MediaKey.V2vVideo -> VideoUtils.FilePrefix.VIDEO_TO_VIDEO
++            is MediaKey.R2vVideo -> VideoUtils.FilePrefix.REFERENCE_TO_VIDEO
+             else -> null
+         }
+         if (prefix != null) {
+@@ -665,6 +674,7 @@ object MediaStateHolder {
+                 MediaKey.ItvPreview,
+                 MediaKey.ItvSource,
+                 MediaKey.V2vPreview,
++                MediaKey.R2vPreview,
+                 MediaKey.IteReferenceImage1,
+                 MediaKey.IteReferenceImage2
+             )
+@@ -717,6 +727,12 @@ object MediaStateHolder {
+                 DebugLogger.d(TAG, "loadFromDisk: V2V video -> LOADED (promptId: ${promptId.take(8)}...)")
+             }
+ 
++            if (dirtyVideos.none { it is MediaKey.R2vVideo }) loadLatestVideoFile(context, serverPrefix, VideoUtils.FilePrefix.REFERENCE_TO_VIDEO) { promptId, bytes ->
++                videoBytes[MediaKey.R2vVideo(promptId)] = bytes
++                currentR2vPromptId = promptId
++                DebugLogger.d(TAG, "loadFromDisk: R2V video -> LOADED (promptId: ${promptId.take(8)}...)")
++            }
++
+             // Video to Video's source video
+             if (MediaKey.V2vSource !in dirtyVideos) {
+                 try {
+@@ -768,6 +784,7 @@ object MediaStateHolder {
+             is MediaKey.TtvVideo -> if (key.promptId == currentTtvPromptId) currentTtvPromptId = null
+             is MediaKey.ItvVideo -> if (key.promptId == currentItvPromptId) currentItvPromptId = null
+             is MediaKey.V2vVideo -> if (key.promptId == currentV2vPromptId) currentV2vPromptId = null
++            is MediaKey.R2vVideo -> if (key.promptId == currentR2vPromptId) currentR2vPromptId = null
+             else -> { }
+         }
+     }
+@@ -804,6 +821,7 @@ object MediaStateHolder {
+         currentTtvPromptId = null
+         currentItvPromptId = null
+         currentV2vPromptId = null
++        currentR2vPromptId = null
+     }
+ 
+     /**
+@@ -819,6 +837,9 @@ object MediaStateHolder {
+     /** The current Video-to-Video prompt ID (if any video is loaded). */
+     fun getCurrentV2vPromptId(): String? = currentV2vPromptId
+ 
++    /** The current Reference-to-Video prompt ID (if any video is loaded). */
++    fun getCurrentR2vPromptId(): String? = currentR2vPromptId
++
+     /**
+      * Clear the current Text-to-Video prompt ID tracking.
+      * This prevents video restoration on subsequent screen initializations.
+@@ -840,6 +861,11 @@ object MediaStateHolder {
+         currentV2vPromptId = null
+     }
+ 
++    /** Clear the current Reference-to-Video prompt ID tracking. */
++    fun clearCurrentR2vPromptId() {
++        currentR2vPromptId = null
++    }
++
+     /**
+      * Discover video prompt IDs from disk without loading bytes into memory.
+      * Used in disk-first mode to enable video restoration on app restart.
+@@ -894,6 +920,21 @@ object MediaStateHolder {
+         } catch (_: Exception) {
+             // Ignore discovery failures
+         }
++
++        // Discover R2V video
++        try {
++            val fullPrefix = "$serverPrefix${VideoUtils.FilePrefix.REFERENCE_TO_VIDEO}"
++            context.filesDir.listFiles()
++                ?.filter { it.name.startsWith(fullPrefix) && it.name.endsWith(".mp4") }
++                ?.maxByOrNull { it.lastModified() }
++                ?.let { file ->
++                    currentR2vPromptId = file.name
++                        .removePrefix(fullPrefix)
++                        .removeSuffix(".mp4")
++                }
++        } catch (_: Exception) {
++            // Ignore discovery failures
++        }
+     }
+ 
+     /**
+diff --git a/app/src/main/java/sh/hnet/comfychair/model/PromptPreset.kt b/app/src/main/java/sh/hnet/comfychair/model/PromptPreset.kt
+index f5cd4e7..10e0790 100644
+--- a/app/src/main/java/sh/hnet/comfychair/model/PromptPreset.kt
++++ b/app/src/main/java/sh/hnet/comfychair/model/PromptPreset.kt
+@@ -17,7 +17,8 @@ enum class ScreenType {
+     IMAGE_TO_IMAGE,  // Shared for both Inpainting and Editing modes
+     TEXT_TO_VIDEO,
+     IMAGE_TO_VIDEO,
+-    VIDEO_TO_VIDEO
++    VIDEO_TO_VIDEO,
++    REFERENCE_TO_VIDEO
+ }
+ 
+ /**
+@@ -30,6 +31,7 @@ fun ScreenType.displayName(): String = when (this) {
+     ScreenType.TEXT_TO_VIDEO -> stringResource(R.string.screen_type_text_to_video)
+     ScreenType.IMAGE_TO_VIDEO -> stringResource(R.string.screen_type_image_to_video)
+     ScreenType.VIDEO_TO_VIDEO -> stringResource(R.string.screen_type_video_to_video)
++    ScreenType.REFERENCE_TO_VIDEO -> stringResource(R.string.screen_type_reference_to_video)
+ }
+ 
+ /**
+diff --git a/app/src/main/java/sh/hnet/comfychair/navigation/AppNavigation.kt b/app/src/main/java/sh/hnet/comfychair/navigation/AppNavigation.kt
+index 3b03feb..e462670 100644
+--- a/app/src/main/java/sh/hnet/comfychair/navigation/AppNavigation.kt
++++ b/app/src/main/java/sh/hnet/comfychair/navigation/AppNavigation.kt
+@@ -11,6 +11,7 @@ sealed class MainRoute(val route: String) {
+     data object TextToVideo : MainRoute("text_to_video")
+     data object ImageToVideo : MainRoute("image_to_video")
+     data object VideoToVideo : MainRoute("video_to_video")
++    data object ReferenceToVideo : MainRoute("reference_to_video")
+     data object Gallery : MainRoute("gallery")
+     data object Settings : MainRoute("settings")
+ }
+diff --git a/app/src/main/java/sh/hnet/comfychair/storage/BackupManager.kt b/app/src/main/java/sh/hnet/comfychair/storage/BackupManager.kt
+index 213c6b1..5cf75ca 100644
+--- a/app/src/main/java/sh/hnet/comfychair/storage/BackupManager.kt
++++ b/app/src/main/java/sh/hnet/comfychair/storage/BackupManager.kt
+@@ -72,6 +72,7 @@ class BackupManager(private val context: Context) {
+         private const val PREFS_TEXT_TO_VIDEO = "TextToVideoFragmentPrefs"
+         private const val PREFS_IMAGE_TO_VIDEO = "ImageToVideoFragmentPrefs"
+         private const val PREFS_VIDEO_TO_VIDEO = "VideoToVideoFragmentPrefs"
++        private const val PREFS_REFERENCE_TO_VIDEO = "ReferenceToVideoFragmentPrefs"
+         private const val PREFS_WORKFLOW_VALUES = "WorkflowValuesPrefs"
+         private const val PREFS_USER_WORKFLOWS = "UserWorkflowsPrefs"
+         private const val PREFS_PROMPT_PRESETS = "PromptPresetPrefs"
+@@ -275,6 +276,7 @@ class BackupManager(private val context: Context) {
+                 put("textToVideo", readTextToVideoPrefs(server.id))
+                 put("imageToVideo", readImageToVideoPrefs(server.id))
+                 put("videoToVideo", readVideoScreenPrefs(PREFS_VIDEO_TO_VIDEO, server.id))
++                put("referenceToVideo", readVideoScreenPrefs(PREFS_REFERENCE_TO_VIDEO, server.id))
+             })
+         }
+         return result
+@@ -461,6 +463,9 @@ class BackupManager(private val context: Context) {
+             serverPrefs.optJSONObject("videoToVideo")?.let {
+                 restoreVideoScreenPrefs(PREFS_VIDEO_TO_VIDEO, it, actualServerId)
+             }
++            serverPrefs.optJSONObject("referenceToVideo")?.let {
++                restoreVideoScreenPrefs(PREFS_REFERENCE_TO_VIDEO, it, actualServerId)
++            }
+         }
+     }
+ 
+diff --git a/app/src/main/java/sh/hnet/comfychair/storage/PreferencesMaintenance.kt b/app/src/main/java/sh/hnet/comfychair/storage/PreferencesMaintenance.kt
+index 43103f1..8d65777 100644
+--- a/app/src/main/java/sh/hnet/comfychair/storage/PreferencesMaintenance.kt
++++ b/app/src/main/java/sh/hnet/comfychair/storage/PreferencesMaintenance.kt
+@@ -22,6 +22,7 @@ object PreferencesMaintenance {
+     private const val PREFS_TEXT_TO_VIDEO = "TextToVideoFragmentPrefs"
+     private const val PREFS_IMAGE_TO_VIDEO = "ImageToVideoFragmentPrefs"
+     private const val PREFS_VIDEO_TO_VIDEO = "VideoToVideoFragmentPrefs"
++    private const val PREFS_REFERENCE_TO_VIDEO = "ReferenceToVideoFragmentPrefs"
+ 
+     private const val PREFS_APP_SETTINGS = "AppSettings"
+ 
+@@ -176,7 +177,8 @@ object PreferencesMaintenance {
+             PREFS_IMAGE_TO_IMAGE,
+             PREFS_TEXT_TO_VIDEO,
+             PREFS_IMAGE_TO_VIDEO,
+-            PREFS_VIDEO_TO_VIDEO
++            PREFS_VIDEO_TO_VIDEO,
++            PREFS_REFERENCE_TO_VIDEO
+         )
+ 
+         var totalRemoved = 0
+diff --git a/app/src/main/java/sh/hnet/comfychair/ui/components/config/BottomSheetConfigExtensions.kt b/app/src/main/java/sh/hnet/comfychair/ui/components/config/BottomSheetConfigExtensions.kt
+index fa795d3..8343f60 100644
+--- a/app/src/main/java/sh/hnet/comfychair/ui/components/config/BottomSheetConfigExtensions.kt
++++ b/app/src/main/java/sh/hnet/comfychair/ui/components/config/BottomSheetConfigExtensions.kt
+@@ -9,6 +9,7 @@ import sh.hnet.comfychair.viewmodel.ImageToImageMode
+ import sh.hnet.comfychair.viewmodel.ImageToImageUiState
+ import sh.hnet.comfychair.viewmodel.ImageToVideoUiState
+ import sh.hnet.comfychair.viewmodel.VideoToVideoUiState
++import sh.hnet.comfychair.viewmodel.ReferenceToVideoUiState
+ import sh.hnet.comfychair.viewmodel.TextToImageUiState
+ import sh.hnet.comfychair.viewmodel.TextToVideoUiState
+ 
+@@ -152,6 +153,9 @@ fun ImageToVideoUiState.toBottomSheetConfig(callbacks: UnifiedCallbacks): Bottom
+ fun VideoToVideoUiState.toBottomSheetConfig(callbacks: UnifiedCallbacks): BottomSheetConfig =
+     toBottomSheetConfig(availableWorkflows, callbacks)
+ 
++fun ReferenceToVideoUiState.toBottomSheetConfig(callbacks: UnifiedCallbacks): BottomSheetConfig =
++    toBottomSheetConfig(availableWorkflows, callbacks)
++
+ /** The workflow menu of a screen with one kind of workflow: one untitled group. */
+ fun singleWorkflowGroup(workflows: List<WorkflowItemBase>, onWorkflowChange: (String) -> Unit): List<WorkflowGroup> =
+     listOf(WorkflowGroup(null, workflows, isCurrent = true, icon = WorkflowIcons.default, onSelect = onWorkflowChange))
+diff --git a/app/src/main/java/sh/hnet/comfychair/ui/components/generation/QueueSheet.kt b/app/src/main/java/sh/hnet/comfychair/ui/components/generation/QueueSheet.kt
+index 5e2f09a..83a426e 100644
+--- a/app/src/main/java/sh/hnet/comfychair/ui/components/generation/QueueSheet.kt
++++ b/app/src/main/java/sh/hnet/comfychair/ui/components/generation/QueueSheet.kt
+@@ -76,6 +76,7 @@ private fun ownerInfo(ownerId: String?): OwnerInfo? = when (ownerId) {
+     "TEXT_TO_VIDEO" -> OwnerInfo(R.string.nav_text_to_video, R.drawable.text_to_video_24px)
+     "IMAGE_TO_VIDEO" -> OwnerInfo(R.string.nav_image_to_video, R.drawable.image_to_video_24px)
+     "VIDEO_TO_VIDEO" -> OwnerInfo(R.string.nav_video_to_video, R.drawable.video_to_video_24px)
++    "REFERENCE_TO_VIDEO" -> OwnerInfo(R.string.nav_reference_to_video, R.drawable.image_to_video_24px)
+     else -> null
+ }
+ 
+diff --git a/app/src/main/java/sh/hnet/comfychair/ui/navigation/MainNavHost.kt b/app/src/main/java/sh/hnet/comfychair/ui/navigation/MainNavHost.kt
+index 613d49a..46c04d3 100644
+--- a/app/src/main/java/sh/hnet/comfychair/ui/navigation/MainNavHost.kt
++++ b/app/src/main/java/sh/hnet/comfychair/ui/navigation/MainNavHost.kt
+@@ -85,6 +85,7 @@ import sh.hnet.comfychair.ui.screens.SettingsRootScreen
+ import sh.hnet.comfychair.ui.screens.TextToImageScreen
+ import sh.hnet.comfychair.ui.screens.TextToVideoScreen
+ import sh.hnet.comfychair.ui.screens.VideoToVideoScreen
++import sh.hnet.comfychair.ui.screens.ReferenceToVideoScreen
+ import sh.hnet.comfychair.ui.screens.LicenseSettingsScreen
+ import sh.hnet.comfychair.ui.screens.WhatsNewSettingsScreen
+ import sh.hnet.comfychair.ui.screens.WorkflowDetailPage
+@@ -111,6 +112,7 @@ import sh.hnet.comfychair.viewmodel.SettingsViewModel
+ import sh.hnet.comfychair.viewmodel.TextToImageViewModel
+ import sh.hnet.comfychair.viewmodel.TextToVideoViewModel
+ import sh.hnet.comfychair.viewmodel.VideoToVideoViewModel
++import sh.hnet.comfychair.viewmodel.ReferenceToVideoViewModel
+ import sh.hnet.comfychair.viewmodel.WorkflowManagementViewModel
+ 
+ /**
+@@ -128,6 +130,7 @@ fun MainNavHost(
+     textToVideoViewModel: TextToVideoViewModel,
+     imageToVideoViewModel: ImageToVideoViewModel,
+     videoToVideoViewModel: VideoToVideoViewModel,
++    referenceToVideoViewModel: ReferenceToVideoViewModel,
+     galleryViewModel: GalleryViewModel,
+     mediaViewerViewModel: MediaViewerViewModel,
+     settingsViewModel: SettingsViewModel,
+@@ -450,6 +453,14 @@ fun MainNavHost(
+                                         onUseAsSource = useAsSource
+                                     )
+                                 }
++
++                                composable(MainRoute.ReferenceToVideo.route) {
++                                    ReferenceToVideoScreen(
++                                        generationViewModel = generationViewModel,
++                                        referenceToVideoViewModel = referenceToVideoViewModel,
++                                        onUseAsSource = useAsSource
++                                    )
++                                }
+                             }
+                             // One switch for the tab over the screens, so choosing a source animates it as a toggle
+                             // group does; each screen's top bar keeps its place (SourceSwitchPlaceholder)
+diff --git a/app/src/main/java/sh/hnet/comfychair/ui/navigation/OutputNavigation.kt b/app/src/main/java/sh/hnet/comfychair/ui/navigation/OutputNavigation.kt
+index f4614fb..f74bbc3 100644
+--- a/app/src/main/java/sh/hnet/comfychair/ui/navigation/OutputNavigation.kt
++++ b/app/src/main/java/sh/hnet/comfychair/ui/navigation/OutputNavigation.kt
+@@ -12,6 +12,7 @@ import sh.hnet.comfychair.navigation.MainRoute
+ import sh.hnet.comfychair.navigation.SettingsRoute
+ import sh.hnet.comfychair.viewmodel.ImageToImageViewModel
+ import sh.hnet.comfychair.viewmodel.ImageToVideoViewModel
++import sh.hnet.comfychair.viewmodel.ReferenceToVideoViewModel
+ import sh.hnet.comfychair.viewmodel.TextToImageViewModel
+ import sh.hnet.comfychair.viewmodel.TextToVideoViewModel
+ import sh.hnet.comfychair.viewmodel.VideoToVideoViewModel
+@@ -34,7 +35,8 @@ val OutputTab.sources: List<ScreenSource>
+         OutputTab.VIDEO -> listOf(
+             ScreenSource(R.string.label_source_text, MainRoute.TextToVideo),
+             ScreenSource(R.string.label_source_image, MainRoute.ImageToVideo),
+-            ScreenSource(R.string.label_source_video, MainRoute.VideoToVideo)
++            ScreenSource(R.string.label_source_video, MainRoute.VideoToVideo),
++            ScreenSource(R.string.label_source_references, MainRoute.ReferenceToVideo)
+         )
+     }
+ 
+@@ -48,6 +50,7 @@ fun mainRouteOf(route: String?): MainRoute? = when (route) {
+     MainRoute.TextToVideo.route -> MainRoute.TextToVideo
+     MainRoute.ImageToVideo.route -> MainRoute.ImageToVideo
+     MainRoute.VideoToVideo.route -> MainRoute.VideoToVideo
++    MainRoute.ReferenceToVideo.route -> MainRoute.ReferenceToVideo
+     MainRoute.Gallery.route -> MainRoute.Gallery
+     MainRoute.Settings.route -> MainRoute.Settings
+     else -> null
+@@ -60,6 +63,7 @@ fun routeForOwner(ownerId: String?): MainRoute? = when (ownerId) {
+     TextToVideoViewModel.OWNER_ID -> MainRoute.TextToVideo
+     ImageToVideoViewModel.OWNER_ID -> MainRoute.ImageToVideo
+     VideoToVideoViewModel.OWNER_ID -> MainRoute.VideoToVideo
++    ReferenceToVideoViewModel.OWNER_ID -> MainRoute.ReferenceToVideo
+     else -> null
+ }
+ 
+diff --git a/app/src/main/java/sh/hnet/comfychair/ui/screens/ReferenceToVideoScreen.kt b/app/src/main/java/sh/hnet/comfychair/ui/screens/ReferenceToVideoScreen.kt
+new file mode 100644
+index 0000000..e0f61e3
+--- /dev/null
++++ b/app/src/main/java/sh/hnet/comfychair/ui/screens/ReferenceToVideoScreen.kt
+@@ -0,0 +1,472 @@
++package sh.hnet.comfychair.ui.screens
++
++import androidx.activity.compose.rememberLauncherForActivityResult
++import androidx.activity.result.contract.ActivityResultContracts
++import androidx.compose.foundation.Image
++import androidx.compose.foundation.background
++import androidx.compose.foundation.clickable
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.PaddingValues
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.aspectRatio
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.heightIn
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.size
++import androidx.compose.foundation.lazy.grid.GridCells
++import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
++import androidx.compose.foundation.lazy.grid.items
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.rounded.AddPhotoAlternate
++import androidx.compose.material.icons.rounded.Close
++import androidx.compose.material.icons.rounded.MusicNote
++import androidx.compose.material.icons.rounded.MusicOff
++import androidx.compose.material.icons.rounded.VideoCall
++import androidx.compose.material3.ExperimentalMaterial3Api
++import androidx.compose.material3.FilledTonalButton
++import androidx.compose.material3.Icon
++import androidx.compose.material3.IconButton
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.Surface
++import androidx.compose.material3.Text
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.DisposableEffect
++import androidx.compose.runtime.collectAsState
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.key
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.clip
++import androidx.compose.ui.graphics.asAndroidBitmap
++import androidx.compose.ui.graphics.asImageBitmap
++import androidx.compose.ui.layout.ContentScale
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.res.stringResource
++import androidx.compose.ui.text.style.TextAlign
++import androidx.compose.ui.text.style.TextOverflow
++import androidx.compose.ui.unit.dp
++import androidx.lifecycle.Lifecycle
++import androidx.lifecycle.LifecycleEventObserver
++import androidx.lifecycle.compose.LocalLifecycleOwner
++import androidx.lifecycle.viewmodel.compose.viewModel
++import sh.hnet.comfychair.R
++import sh.hnet.comfychair.WorkflowManager.ReferenceKind
++import sh.hnet.comfychair.model.ScreenType
++import sh.hnet.comfychair.navigation.MainRoute
++import sh.hnet.comfychair.queue.JobDescription
++import sh.hnet.comfychair.queue.JobRegistry
++import sh.hnet.comfychair.ui.components.LocalMediaViewer
++import sh.hnet.comfychair.ui.components.ResultHeroImage
++import sh.hnet.comfychair.ui.components.ResultHeroVideo
++import sh.hnet.comfychair.ui.components.ResultsPreview
++import sh.hnet.comfychair.ui.components.UseAsSource
++import sh.hnet.comfychair.ui.components.VideoPlayer
++import sh.hnet.comfychair.ui.components.config.singleWorkflowGroup
++import sh.hnet.comfychair.ui.components.config.toBottomSheetConfig
++import sh.hnet.comfychair.ui.components.generation.EmptyResultState
++import sh.hnet.comfychair.ui.components.generation.GenerationControls
++import sh.hnet.comfychair.ui.components.generation.GenerationOptionsSheet
++import sh.hnet.comfychair.ui.components.generation.GenerationPreviewArea
++import sh.hnet.comfychair.ui.components.generation.GenerationScreenEffects
++import sh.hnet.comfychair.ui.components.generation.GenerationTopBar
++import sh.hnet.comfychair.ui.components.generation.PromptDock
++import sh.hnet.comfychair.ui.components.generation.PromptPresetDialogs
++import sh.hnet.comfychair.ui.components.generation.RecipeChips
++import sh.hnet.comfychair.ui.components.generation.ResultActionsMenu
++import sh.hnet.comfychair.ui.components.generation.ResultMedia
++import sh.hnet.comfychair.ui.components.generation.ScreenJobStatus
++import sh.hnet.comfychair.ui.components.generation.SourceResultSwitcher
++import sh.hnet.comfychair.ui.components.generation.WorkflowIcons
++import sh.hnet.comfychair.ui.components.generation.rememberJobSubmitter
++import sh.hnet.comfychair.ui.components.generation.rememberOutputThumbnail
++import sh.hnet.comfychair.ui.components.generation.rememberPromptInputState
++import sh.hnet.comfychair.ui.components.generation.rememberVideoFrame
++import sh.hnet.comfychair.ui.components.generation.resultSendActions
++import sh.hnet.comfychair.ui.components.generation.videoSendActions
++import sh.hnet.comfychair.ui.components.loadResultBitmap
++import sh.hnet.comfychair.ui.components.readShownVideo
++import sh.hnet.comfychair.ui.components.rememberResultsViewer
++import sh.hnet.comfychair.util.VideoUtils
++import sh.hnet.comfychair.viewmodel.ContentType
++import sh.hnet.comfychair.viewmodel.GenerationViewModel
++import sh.hnet.comfychair.viewmodel.PromptPresetViewModel
++import sh.hnet.comfychair.viewmodel.ReferenceItem
++import sh.hnet.comfychair.viewmodel.ReferenceToVideoViewMode
++import sh.hnet.comfychair.viewmodel.ReferenceToVideoViewModel
++import sh.hnet.comfychair.viewmodel.tags
++
++/**
++ * Reference to Video (MiniMax H3 ref2va): images, videos and audio clips as references, each with the tag that names
++ * it in the prompt. The workflow's MiniMaxH3ReferenceToVideo node gets them when generating.
++ */
++@OptIn(ExperimentalMaterial3Api::class)
++@Composable
++fun ReferenceToVideoScreen(
++    generationViewModel: GenerationViewModel,
++    referenceToVideoViewModel: ReferenceToVideoViewModel,
++    onUseAsSource: UseAsSource,
++    presetViewModel: PromptPresetViewModel = viewModel()
++) {
++    val context = LocalContext.current
++    val lifecycleOwner = LocalLifecycleOwner.current
++    val ownerId = ReferenceToVideoViewModel.OWNER_ID
++
++    val uiState by referenceToVideoViewModel.uiState.collectAsState()
++    val presetUiState by presetViewModel.uiState.collectAsState()
++    val queueState by JobRegistry.queueState.collectAsState()
++
++    GenerationScreenEffects(
++        referenceToVideoViewModel, generationViewModel, presetViewModel, ScreenType.REFERENCE_TO_VIDEO, ownerId,
++        onJobStarted = { referenceToVideoViewModel.onViewModeChange(ReferenceToVideoViewMode.PREVIEW) }
++    )
++    val promptInput = rememberPromptInputState()
++    var showOptionsSheet by remember { mutableStateOf(false) }
++
++    val isThisScreenExecuting = queueState.executingOwnerId == ownerId
++    val showResults = !isThisScreenExecuting && uiState.generationOutputs.size > 1
++    val isThisScreenQueued = !isThisScreenExecuting && queueState.hasWaitingJob(ownerId)
++    val videoUri = uiState.currentVideoUri
++    val previewBitmap = uiState.previewBitmap
++    val references = uiState.references
++    val hasVisualReference = references.any { it.kind != ReferenceKind.AUDIO }
++
++    // Video plays only while the screen is resumed, so it doesn't render over navigation transitions
++    var isScreenVisible by remember { mutableStateOf(true) }
++    DisposableEffect(lifecycleOwner) {
++        val observer = LifecycleEventObserver { _, event ->
++            isScreenVisible = event.targetState.isAtLeast(Lifecycle.State.RESUMED)
++        }
++        lifecycleOwner.lifecycle.addObserver(observer)
++        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
++    }
++
++    // One picker per kind of reference, from the device
++    val pickImage = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
++        if (uri != null) referenceToVideoViewModel.addReference(context, uri, ReferenceKind.IMAGE)
++    }
++    val pickVideo = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
++        if (uri != null) referenceToVideoViewModel.addReference(context, uri, ReferenceKind.VIDEO)
++    }
++    val pickAudio = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
++        if (uri != null) referenceToVideoViewModel.addReference(context, uri, ReferenceKind.AUDIO)
++    }
++
++    val mediaViewer = LocalMediaViewer.current
++
++    val submitJob = rememberJobSubmitter(
++        generationViewModel = generationViewModel,
++        ownerId = ownerId,
++        describeJob = { JobDescription(uiState.positivePrompt, uiState.selectedWorkflow) },
++        prepareWorkflow = { referenceToVideoViewModel.prepareWorkflow() },
++        contentType = ContentType.VIDEO
++    )
++
++    Column(modifier = Modifier.fillMaxSize()) {
++        GenerationTopBar(
++            screen = MainRoute.ReferenceToVideo,
++            ownerId = ownerId,
++            generationViewModel = generationViewModel
++        )
++
++        val firstThumbnail = references.firstNotNullOfOrNull { it.thumbnail }
++        val sourceThumb = remember(firstThumbnail) { firstThumbnail?.asImageBitmap() }
++        val liveThumb = remember(previewBitmap) { previewBitmap?.asImageBitmap() }
++        val outputThumb = rememberOutputThumbnail(uiState.generationOutputs.getOrNull(uiState.currentResultIndex).takeIf { showResults })
++        val videoFrame = rememberVideoFrame(videoUri.takeIf { !showResults }, sizeDp = 180.dp)
++        val resultThumb = liveThumb ?: (if (showResults) outputThumb else videoFrame)
++
++        GenerationPreviewArea {
++            Box(
++                modifier = Modifier
++                    .fillMaxSize()
++                    .heightIn(min = 150.dp)
++                    .background(MaterialTheme.colorScheme.surfaceContainer)
++                    .clickable(
++                        enabled = uiState.viewMode == ReferenceToVideoViewMode.PREVIEW && videoUri != null && !showResults,
++                        onClick = { videoUri?.let { uri -> mediaViewer.openVideo(uri, originKey = VIDEO_ORIGIN) } }
++                    ),
++                contentAlignment = Alignment.Center
++            ) {
++                SourceResultSwitcher(
++                    showSource = uiState.viewMode == ReferenceToVideoViewMode.SOURCE,
++                    onShowSourceChange = { showSource ->
++                        referenceToVideoViewModel.onViewModeChange(
++                            if (showSource) ReferenceToVideoViewMode.SOURCE else ReferenceToVideoViewMode.PREVIEW
++                        )
++                    },
++                    sourceThumb = sourceThumb,
++                    resultThumb = resultThumb,
++                    source = { _ ->
++                        ReferencePanel(
++                            references = references,
++                            onAddImage = { pickImage.launch("image/*") },
++                            onAddVideo = { pickVideo.launch("video/*") },
++                            onAddAudio = { pickAudio.launch("audio/*") },
++                            onInsertTag = referenceToVideoViewModel::insertTag,
++                            onRemove = referenceToVideoViewModel::removeReference,
++                            onSoundChange = referenceToVideoViewModel::onReferenceSoundChange
++                        )
++                    },
++                    result = { inTransition ->
++                        when {
++                            showResults -> {
++                                val results = uiState.generationOutputs
++                                val openViewer = rememberResultsViewer(results, referenceToVideoViewModel::onCurrentResultChange)
++                                val firstVideo = results.firstOrNull { it.isVideo }
++                                ResultsPreview(
++                                    results = results,
++                                    currentIndex = uiState.currentResultIndex,
++                                    onCurrentIndexChange = referenceToVideoViewModel::onCurrentResultChange,
++                                    onOpenViewer = openViewer,
++                                    stripEnabled = !isThisScreenQueued,
++                                    heroOverlay = { current ->
++                                        key(current.id) {
++                                            ResultActionsMenu(
++                                                media = ResultMedia.output(current, VideoUtils.GalleryPrefix.REFERENCE_TO_VIDEO),
++                                                sendActions = resultSendActions(onUseAsSource, current) { loadResultBitmap(current) },
++                                                resultNumber = results.indexOf(current) + 1
++                                            )
++                                        }
++                                    }
++                                ) { output, isCurrent ->
++                                    if (output.isVideo) {
++                                        ResultHeroVideo(
++                                            output = output,
++                                            isCurrent = isCurrent,
++                                            isActive = isScreenVisible && !inTransition,
++                                            preloadedUri = videoUri.takeIf { output == firstVideo }
++                                        )
++                                    } else {
++                                        ResultHeroImage(output)
++                                    }
++                                }
++                            }
++                            previewBitmap != null -> {
++                                Image(
++                                    bitmap = previewBitmap.asImageBitmap(),
++                                    contentDescription = stringResource(R.string.content_description_preview),
++                                    modifier = Modifier.fillMaxSize(),
++                                    contentScale = ContentScale.Crop
++                                )
++                            }
++                            videoUri != null -> {
++                                VideoPlayer(
++                                    videoUri = videoUri,
++                                    modifier = Modifier.fillMaxSize(),
++                                    isActive = isScreenVisible && !inTransition,
++                                    showPlaybackStatus = true,
++                                    placeholder = videoFrame?.asAndroidBitmap(),
++                                    originKey = VIDEO_ORIGIN,
++                                    originCorner = 28.dp
++                                )
++                                ResultActionsMenu(
++                                    media = ResultMedia.video(videoUri, VideoUtils.GalleryPrefix.REFERENCE_TO_VIDEO),
++                                    sendActions = videoSendActions(onUseAsSource) { readShownVideo(context, videoUri) }
++                                )
++                            }
++                            else -> {
++                                EmptyResultState()
++                            }
++                        }
++                        ScreenJobStatus(ownerId, generationViewModel)
++                    }
++                )
++            }
++        }
++
++        PromptDock(
++            state = uiState,
++            onPositiveChange = referenceToVideoViewModel::onPositivePromptChange,
++            onNegativeChange = referenceToVideoViewModel::onNegativePromptChange,
++            preview = uiState.previewBitmap ?: firstThumbnail,
++            presetViewModel = presetViewModel,
++            presetUiState = presetUiState,
++            spellCheckEnabled = promptInput.spellCheckEnabled,
++            generateEnabled = referenceToVideoViewModel.hasValidConfiguration(),
++            onGenerate = { submitJob(false) }
++        )
++
++        RecipeChips(
++            state = uiState,
++            viewModel = referenceToVideoViewModel,
++            icon = WorkflowIcons.default,
++            groups = singleWorkflowGroup(uiState.availableWorkflows, referenceToVideoViewModel::onWorkflowChange)
++        )
++
++        GenerationControls(
++            missingSource = !hasVisualReference,
++            isEnabled = referenceToVideoViewModel.hasValidConfiguration(),
++            generationViewModel = generationViewModel,
++            ownerId = ownerId,
++            hasPositivePrompt = uiState.capabilities.hasPositivePrompt,
++            isFetching = uiState.isFetching,
++            optionsOpen = showOptionsSheet,
++            onOpenOptions = { showOptionsSheet = true },
++            isUploading = uiState.isUploading,
++            submit = submitJob
++        )
++    }
++
++    GenerationOptionsSheet(
++        visible = showOptionsSheet,
++        onDismiss = { showOptionsSheet = false },
++        viewModel = referenceToVideoViewModel,
++        state = uiState
++    ) { callbacks -> uiState.toBottomSheetConfig(callbacks) }
++
++    PromptPresetDialogs(presetViewModel, presetUiState, uiState.positivePrompt)
++}
++
++/** The references with their tags, and a button per kind to add one. */
++@Composable
++private fun ReferencePanel(
++    references: List<ReferenceItem>,
++    onAddImage: () -> Unit,
++    onAddVideo: () -> Unit,
++    onAddAudio: () -> Unit,
++    onInsertTag: (ReferenceItem) -> Unit,
++    onRemove: (String) -> Unit,
++    onSoundChange: (String, Boolean) -> Unit
++) {
++    val tags = remember(references) { references.tags() }
++    Column(modifier = Modifier.fillMaxSize().padding(12.dp)) {
++        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
++            AddButton(Icons.Rounded.AddPhotoAlternate, R.string.button_add_image_reference, onAddImage, Modifier.weight(1f))
++            AddButton(Icons.Rounded.VideoCall, R.string.button_add_video_reference, onAddVideo, Modifier.weight(1f))
++            AddButton(Icons.Rounded.MusicNote, R.string.button_add_audio_reference, onAddAudio, Modifier.weight(1f))
++        }
++        if (references.isEmpty()) {
++            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
++                Text(
++                    text = stringResource(R.string.label_r2v_hint),
++                    style = MaterialTheme.typography.bodyMedium,
++                    color = MaterialTheme.colorScheme.onSurfaceVariant,
++                    textAlign = TextAlign.Center,
++                    modifier = Modifier.padding(16.dp)
++                )
++            }
++        } else {
++            LazyVerticalGrid(
++                columns = GridCells.Adaptive(minSize = 96.dp),
++                modifier = Modifier.fillMaxSize().padding(top = 8.dp),
++                contentPadding = PaddingValues(bottom = 8.dp),
++                horizontalArrangement = Arrangement.spacedBy(8.dp),
++                verticalArrangement = Arrangement.spacedBy(8.dp)
++            ) {
++                items(references, key = { it.id }) { item ->
++                    ReferenceCard(
++                        item = item,
++                        tags = tags[item.id].orEmpty().joinToString(" "),
++                        onClick = { onInsertTag(item) },
++                        onRemove = { onRemove(item.id) },
++                        onSoundChange = { onSoundChange(item.id, it) }
++                    )
++                }
++            }
++        }
++    }
++}
++
++@Composable
++private fun AddButton(
++    icon: androidx.compose.ui.graphics.vector.ImageVector,
++    labelRes: Int,
++    onClick: () -> Unit,
++    modifier: Modifier = Modifier
++) {
++    FilledTonalButton(onClick = onClick, modifier = modifier, contentPadding = PaddingValues(horizontal = 8.dp)) {
++        Icon(icon, contentDescription = null, modifier = Modifier.size(18.dp))
++        Text(
++            text = stringResource(labelRes),
++            maxLines = 1,
++            overflow = TextOverflow.Ellipsis,
++            modifier = Modifier.padding(start = 4.dp)
++        )
++    }
++}
++
++/** A reference: its picture (or a note for audio), its tag; tapping it puts the tag in the prompt. */
++@Composable
++private fun ReferenceCard(
++    item: ReferenceItem,
++    tags: String,
++    onClick: () -> Unit,
++    onRemove: () -> Unit,
++    onSoundChange: (Boolean) -> Unit
++) {
++    val shape = RoundedCornerShape(16.dp)
++    val thumbnail = remember(item.thumbnail) { item.thumbnail?.asImageBitmap() }
++    Box(
++        modifier = Modifier
++            .aspectRatio(1f)
++            .clip(shape)
++            .background(MaterialTheme.colorScheme.surfaceContainerHighest)
++            .clickable(onClick = onClick)
++    ) {
++        if (thumbnail != null) {
++            Image(
++                bitmap = thumbnail,
++                contentDescription = item.name,
++                modifier = Modifier.fillMaxSize(),
++                contentScale = ContentScale.Crop
++            )
++        } else {
++            Column(
++                modifier = Modifier.fillMaxSize().padding(8.dp),
++                verticalArrangement = Arrangement.Center,
++                horizontalAlignment = Alignment.CenterHorizontally
++            ) {
++                Icon(Icons.Rounded.MusicNote, contentDescription = null, modifier = Modifier.size(28.dp))
++                Text(
++                    text = item.name,
++                    style = MaterialTheme.typography.labelSmall,
++                    maxLines = 2,
++                    overflow = TextOverflow.Ellipsis,
++                    textAlign = TextAlign.Center
++                )
++            }
++        }
++        // The tag, as the prompt names the reference
++        Surface(
++            modifier = Modifier.align(Alignment.BottomStart).padding(4.dp),
++            shape = RoundedCornerShape(8.dp),
++            color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.9f)
++        ) {
++            Text(
++                text = tags,
++                style = MaterialTheme.typography.labelSmall,
++                maxLines = 2,
++                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
++            )
++        }
++        IconButton(onClick = onRemove, modifier = Modifier.align(Alignment.TopEnd).size(32.dp)) {
++            Surface(shape = RoundedCornerShape(50), color = MaterialTheme.colorScheme.surface.copy(alpha = 0.8f)) {
++                Icon(
++                    Icons.Rounded.Close,
++                    contentDescription = stringResource(R.string.content_description_remove_reference),
++                    modifier = Modifier.padding(4.dp).size(16.dp)
++                )
++            }
++        }
++        if (item.kind == ReferenceKind.VIDEO && item.hasSound) {
++            IconButton(onClick = { onSoundChange(!item.withSound) }, modifier = Modifier.align(Alignment.TopStart).size(32.dp)) {
++                Surface(shape = RoundedCornerShape(50), color = MaterialTheme.colorScheme.surface.copy(alpha = 0.8f)) {
++                    Icon(
++                        if (item.withSound) Icons.Rounded.MusicNote else Icons.Rounded.MusicOff,
++                        contentDescription = stringResource(R.string.label_reference_video_sound),
++                        modifier = Modifier.padding(4.dp).size(16.dp)
++                    )
++                }
++            }
++        }
++    }
++}
++
++private const val VIDEO_ORIGIN = "r2v_video"
+diff --git a/app/src/main/java/sh/hnet/comfychair/ui/screens/WorkflowsSettingsScreen.kt b/app/src/main/java/sh/hnet/comfychair/ui/screens/WorkflowsSettingsScreen.kt
+index 8e1caf8..8e5a6c8 100644
+--- a/app/src/main/java/sh/hnet/comfychair/ui/screens/WorkflowsSettingsScreen.kt
++++ b/app/src/main/java/sh/hnet/comfychair/ui/screens/WorkflowsSettingsScreen.kt
+@@ -221,7 +221,8 @@ fun WorkflowsSettingsScreen(
+         WorkflowSectionData(WorkflowType.ITI_INPAINTING, R.string.workflow_section_iti_inpainting, uiState.itiInpaintingWorkflows),
+         WorkflowSectionData(WorkflowType.TTV, R.string.workflow_section_ttv, uiState.ttvWorkflows),
+         WorkflowSectionData(WorkflowType.ITV, R.string.workflow_section_itv, uiState.itvWorkflows),
+-        WorkflowSectionData(WorkflowType.V2V, R.string.workflow_section_v2v, uiState.v2vWorkflows)
++        WorkflowSectionData(WorkflowType.V2V, R.string.workflow_section_v2v, uiState.v2vWorkflows),
++        WorkflowSectionData(WorkflowType.R2V, R.string.workflow_section_r2v, uiState.r2vWorkflows)
+     )
+     val allWorkflows = allSections.flatMap { it.workflows }
+     val enabledTotal = allWorkflows.count { it.id !in uiState.disabledWorkflowIds }
+@@ -286,7 +287,8 @@ fun WorkflowsSettingsScreen(
+ 
+ /** Order of the sections on the list. */
+ private val sectionOrder = listOf(
+-    WorkflowType.TTI, WorkflowType.ITI_EDITING, WorkflowType.ITI_INPAINTING, WorkflowType.TTV, WorkflowType.ITV, WorkflowType.V2V
++    WorkflowType.TTI, WorkflowType.ITI_EDITING, WorkflowType.ITI_INPAINTING, WorkflowType.TTV, WorkflowType.ITV, WorkflowType.V2V,
++    WorkflowType.R2V
+ )
+ 
+ /** How long a just-imported workflow's row stays highlighted before fading back. */
+@@ -301,7 +303,8 @@ private val filterLabels = listOf(
+     WorkflowFilter.ITI to R.string.label_workflows_filter_iti,
+     WorkflowFilter.TTV to R.string.workflow_section_ttv,
+     WorkflowFilter.ITV to R.string.workflow_section_itv,
+-    WorkflowFilter.V2V to R.string.workflow_section_v2v
++    WorkflowFilter.V2V to R.string.workflow_section_v2v,
++    WorkflowFilter.R2V to R.string.workflow_section_r2v
+ )
+ 
+ /** Which types the page shows: one choice, scrolled into view when picked. */
+@@ -615,6 +618,7 @@ private fun WorkflowType.titleRes(): Int = when (this) {
+     WorkflowType.TTV -> R.string.workflow_section_ttv
+     WorkflowType.ITV -> R.string.workflow_section_itv
+     WorkflowType.V2V -> R.string.workflow_section_v2v
++    WorkflowType.R2V -> R.string.workflow_section_r2v
+ }
+ 
+ /** The generation screen that offers workflows of a type. */
+@@ -624,6 +628,7 @@ private fun WorkflowType.screenRes(): Int = when (this) {
+     WorkflowType.TTV -> R.string.nav_text_to_video
+     WorkflowType.ITV -> R.string.nav_image_to_video
+     WorkflowType.V2V -> R.string.nav_video_to_video
++    WorkflowType.R2V -> R.string.nav_reference_to_video
+ }
+ 
+ /**
+@@ -649,7 +654,7 @@ fun WorkflowDetailPage(
+     val current = remember(uiState, workflowId) {
+         listOf(
+             uiState.ttiWorkflows, uiState.itiEditingWorkflows, uiState.itiInpaintingWorkflows, uiState.ttvWorkflows,
+-            uiState.itvWorkflows, uiState.v2vWorkflows
++            uiState.itvWorkflows, uiState.v2vWorkflows, uiState.r2vWorkflows
+         ).flatten()
+             .firstOrNull { it.id == workflowId }
+     }
+diff --git a/app/src/main/java/sh/hnet/comfychair/util/VideoUtils.kt b/app/src/main/java/sh/hnet/comfychair/util/VideoUtils.kt
+index 9e54da8..560d8d6 100644
+--- a/app/src/main/java/sh/hnet/comfychair/util/VideoUtils.kt
++++ b/app/src/main/java/sh/hnet/comfychair/util/VideoUtils.kt
+@@ -64,6 +64,7 @@ object VideoUtils {
+                     FilePrefix.TEXT_TO_VIDEO -> MediaStateHolder.MediaKey.TtvVideo(promptId)
+                     FilePrefix.IMAGE_TO_VIDEO -> MediaStateHolder.MediaKey.ItvVideo(promptId)
+                     FilePrefix.VIDEO_TO_VIDEO -> MediaStateHolder.MediaKey.V2vVideo(promptId)
++                    FilePrefix.REFERENCE_TO_VIDEO -> MediaStateHolder.MediaKey.R2vVideo(promptId)
+                     else -> null
+                 }
+ 
+@@ -91,6 +92,7 @@ object VideoUtils {
+         const val TEXT_TO_VIDEO = "last_generated_video_"
+         const val IMAGE_TO_VIDEO = "image_to_video_last_generated_"
+         const val VIDEO_TO_VIDEO = "video_to_video_last_generated_"
++        const val REFERENCE_TO_VIDEO = "reference_to_video_last_generated_"
+     }
+ 
+     /**
+@@ -100,5 +102,6 @@ object VideoUtils {
+         const val TEXT_TO_VIDEO = "ComfyChair"
+         const val IMAGE_TO_VIDEO = "ComfyChair_ITV"
+         const val VIDEO_TO_VIDEO = "ComfyChair_V2V"
++        const val REFERENCE_TO_VIDEO = "ComfyChair_R2V"
+     }
+ }
 diff --git a/app/src/main/java/sh/hnet/comfychair/util/WorkflowJsonAnalyzer.kt b/app/src/main/java/sh/hnet/comfychair/util/WorkflowJsonAnalyzer.kt
-index 598b047..666fe51 100644
+index 598b047..46674a2 100644
 --- a/app/src/main/java/sh/hnet/comfychair/util/WorkflowJsonAnalyzer.kt
 +++ b/app/src/main/java/sh/hnet/comfychair/util/WorkflowJsonAnalyzer.kt
-@@ -35,6 +35,35 @@ internal object WorkflowJsonAnalyzer {
-         "v2v_" to WorkflowType.V2V
+@@ -32,9 +32,42 @@ internal object WorkflowJsonAnalyzer {
+         "iti_editing_" to WorkflowType.ITI_EDITING,
+         "ttv_" to WorkflowType.TTV,
+         "itv_" to WorkflowType.ITV,
+-        "v2v_" to WorkflowType.V2V
++        "v2v_" to WorkflowType.V2V,
++        "r2v_" to WorkflowType.R2V
      )
  
 +    /** A diffusion-model loader: ComfyUI's UNETLoader or any variant (UnetLoaderGGUF, UnetLoaderGGUFAdvanced, ...). */
@@ -113,10 +1215,13 @@ index 598b047..666fe51 100644
 +        return root.toString(2)
 +    }
 +
++    /** MiniMax H3's reference-to-video conditioning node (ComfyUI core). */
++    fun isReferenceToVideoNode(classType: String): Boolean = classType == "MiniMaxH3ReferenceToVideo"
++
      /** A node that loads a video file: ComfyUI's LoadVideo or VideoHelperSuite's VHS_LoadVideo (and its FFmpeg variant). */
      fun isVideoLoader(classType: String): Boolean =
          classType == "LoadVideo" || classType == "VHS_LoadVideo" || classType == "VHS_LoadVideoFFmpeg"
-@@ -139,7 +168,7 @@ internal object WorkflowJsonAnalyzer {
+@@ -139,11 +172,14 @@ internal object WorkflowJsonAnalyzer {
  
          // Check for UNET loader
          val hasUNETLoader = classTypes.any { classType ->
@@ -125,7 +1230,14 @@ index 598b047..666fe51 100644
          }
  
          // Detection rules (order matters - most specific first):
-@@ -193,7 +222,7 @@ internal object WorkflowJsonAnalyzer {
+         return when {
++            // Reference-to-video: MiniMax H3's reference node (references are added by the app, not by placeholders)
++            classTypes.any { isReferenceToVideoNode(it) } -> WorkflowType.R2V
++
+             // Video-to-video: loads a video (most specific: such workflows also have video nodes)
+             classTypes.any { isVideoLoader(it) } -> WorkflowType.V2V
+ 
+@@ -193,9 +229,12 @@ internal object WorkflowJsonAnalyzer {
              it.contains("QwenImageEdit", ignoreCase = true)
          }
          val hasCheckpointLoader = classTypes.any { it.equals("CheckpointLoaderSimple", ignoreCase = true) }
@@ -133,7 +1245,427 @@ index 598b047..666fe51 100644
 +        val hasUNETLoader = classTypes.any { isUnetLoader(it) }
  
          return when {
++            // Reference-to-video: MiniMax H3's reference node (references are added by the app, not by placeholders)
++            classTypes.any { isReferenceToVideoNode(it) } -> WorkflowType.R2V
++
              // Video-to-video: loads a video (most specific: such workflows also have video nodes)
+             classTypes.any { isVideoLoader(it) } -> WorkflowType.V2V
+ 
+diff --git a/app/src/main/java/sh/hnet/comfychair/viewmodel/GenerationViewModel.kt b/app/src/main/java/sh/hnet/comfychair/viewmodel/GenerationViewModel.kt
+index 5e140e2..9125d44 100644
+--- a/app/src/main/java/sh/hnet/comfychair/viewmodel/GenerationViewModel.kt
++++ b/app/src/main/java/sh/hnet/comfychair/viewmodel/GenerationViewModel.kt
+@@ -540,6 +540,7 @@ class GenerationViewModel : ViewModel() {
+                     "TEXT_TO_VIDEO" -> VideoUtils.FilePrefix.TEXT_TO_VIDEO
+                     "IMAGE_TO_VIDEO" -> VideoUtils.FilePrefix.IMAGE_TO_VIDEO
+                     "VIDEO_TO_VIDEO" -> VideoUtils.FilePrefix.VIDEO_TO_VIDEO
++                    "REFERENCE_TO_VIDEO" -> VideoUtils.FilePrefix.REFERENCE_TO_VIDEO
+                     else -> {
+                         DebugLogger.w(TAG, "Unknown video owner: $ownerId")
+                         return
+diff --git a/app/src/main/java/sh/hnet/comfychair/viewmodel/ReferenceToVideoViewModel.kt b/app/src/main/java/sh/hnet/comfychair/viewmodel/ReferenceToVideoViewModel.kt
+new file mode 100644
+index 0000000..bd9d1ff
+--- /dev/null
++++ b/app/src/main/java/sh/hnet/comfychair/viewmodel/ReferenceToVideoViewModel.kt
+@@ -0,0 +1,373 @@
++package sh.hnet.comfychair.viewmodel
++
++import android.content.Context
++import android.graphics.Bitmap
++import android.media.MediaExtractor
++import android.media.MediaFormat
++import android.net.Uri
++import android.provider.OpenableColumns
++import android.webkit.MimeTypeMap
++import androidx.lifecycle.viewModelScope
++import java.io.File
++import java.util.UUID
++import kotlin.coroutines.suspendCoroutine
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.flow.update
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.withContext
++import sh.hnet.comfychair.R
++import sh.hnet.comfychair.WorkflowManager
++import sh.hnet.comfychair.WorkflowManager.ReferenceKind
++import sh.hnet.comfychair.WorkflowType
++import sh.hnet.comfychair.cache.MediaStateHolder
++import sh.hnet.comfychair.connection.ConnectionManager
++import sh.hnet.comfychair.ui.components.config.CommonGenerationState
++import sh.hnet.comfychair.util.DebugLogger
++import sh.hnet.comfychair.util.SeasonalPrompts
++import sh.hnet.comfychair.util.VideoFrames
++import sh.hnet.comfychair.util.VideoUtils
++import sh.hnet.comfychair.viewmodel.base.BaseVideoGenerationViewModel
++import sh.hnet.comfychair.viewmodel.base.GenerationParams
++import sh.hnet.comfychair.viewmodel.base.VideoResult
++import sh.hnet.comfychair.viewmodel.base.VideoResultState
++import sh.hnet.comfychair.viewmodel.base.videoScreenDefaults
++
++/** What the Reference to Video preview shows full size: the references or the result. */
++enum class ReferenceToVideoViewMode {
++    SOURCE,
++    PREVIEW
++}
++
++/**
++ * A reference picked for Reference to Video, kept as a file in the app's cache until it's removed.
++ *
++ * @param thumbnail The image itself or a video's first frame, scaled down; null for audio
++ * @param hasSound A video with a soundtrack
++ * @param withSound The soundtrack is passed on too (it then takes an <Audio N> tag)
++ */
++data class ReferenceItem(
++    val id: String,
++    val kind: ReferenceKind,
++    val file: File,
++    val extension: String,
++    val mimeType: String,
++    val name: String,
++    val thumbnail: Bitmap? = null,
++    val hasSound: Boolean = false,
++    val withSound: Boolean = false
++)
++
++/**
++ * The prompt tags of the references, numbered as MiniMax H3 presents them: <Picture N> by image, <Video N> by video,
++ * <Audio N> first for the videos' soundtracks (in video order), then for the standalone audio clips.
++ */
++fun List<ReferenceItem>.tags(): Map<String, List<String>> {
++    var pictures = 0
++    var videos = 0
++    var audios = 0
++    val tags = mutableMapOf<String, MutableList<String>>()
++    filter { it.kind == ReferenceKind.IMAGE }.forEach { tags.getOrPut(it.id) { mutableListOf() } += "<Picture ${++pictures}>" }
++    filter { it.kind == ReferenceKind.VIDEO }.forEach { item ->
++        val list = tags.getOrPut(item.id) { mutableListOf() }
++        if (item.withSound) list += "<Audio ${++audios}>"
++        list += "<Video ${++videos}>"
++    }
++    filter { it.kind == ReferenceKind.AUDIO }.forEach { tags.getOrPut(it.id) { mutableListOf() } += "<Audio ${++audios}>" }
++    return tags
++}
++
++/**
++ * UI state for the Reference to Video screen.
++ *
++ * Generation parameters and the video result are exposed directly through delegation.
++ */
++data class ReferenceToVideoUiState(
++    val params: GenerationParams = videoScreenDefaults,
++    val video: VideoResult = VideoResult(),
++    val availableWorkflows: List<WorkflowItem> = emptyList(),
++    val viewMode: ReferenceToVideoViewMode = ReferenceToVideoViewMode.SOURCE,
++    val references: List<ReferenceItem> = emptyList(),
++    val isUploading: Boolean = false
++) : CommonGenerationState by params, VideoResultState by video
++
++/**
++ * ViewModel for the Reference to Video screen: MiniMax H3 ref2va with up to 9 images, 3 videos and 3 audio clips as
++ * references, wired into the workflow's MiniMaxH3ReferenceToVideo node when generating.
++ *
++ * The references live in the app's cache while the app runs; they aren't restored after a restart.
++ */
++class ReferenceToVideoViewModel : BaseVideoGenerationViewModel<ReferenceToVideoUiState>() {
++
++    companion object {
++        const val OWNER_ID = "REFERENCE_TO_VIDEO"
++
++        const val MAX_IMAGES = 9
++        const val MAX_VIDEOS = 3
++        const val MAX_AUDIOS = 3
++
++        /** Largest reference file, as it's read whole when uploaded */
++        const val MAX_REFERENCE_BYTES = 100L * 1024 * 1024
++
++        private const val THUMB_MAX_PX = 512
++
++        /** MiniMax H3 scales reference images down to a 2048 px short edge at most (never up): nothing above it counts */
++        private const val IMAGE_MAX_SHORT_EDGE = 2048
++        private const val CACHE_DIR = "r2v_references"
++        private const val LOG_TAG = "ReferenceToVideo"
++    }
++
++    override val initialState = ReferenceToVideoUiState()
++
++    override val tag = "ReferenceToVideo"
++    override val ownerId = OWNER_ID
++    override val workflowType = WorkflowType.R2V
++    override val prefsName = "ReferenceToVideoFragmentPrefs"
++    override val videoFilePrefix = VideoUtils.FilePrefix.REFERENCE_TO_VIDEO
++    override val previewKey = MediaStateHolder.MediaKey.R2vPreview
++    override fun videoKey(promptId: String) = MediaStateHolder.MediaKey.R2vVideo(promptId)
++    override fun currentVideoPromptId() = MediaStateHolder.getCurrentR2vPromptId()
++    override fun clearCurrentVideoPromptId() = MediaStateHolder.clearCurrentR2vPromptId()
++    override fun defaultPositivePrompt() = SeasonalPrompts.getImageToVideoPrompt()
++
++    override fun ReferenceToVideoUiState.params() = params
++    override fun ReferenceToVideoUiState.withParams(params: GenerationParams) = copy(params = params)
++    override fun ReferenceToVideoUiState.video() = video
++    override fun ReferenceToVideoUiState.withVideo(video: VideoResult) = copy(video = video)
++    override fun ReferenceToVideoUiState.workflows() = availableWorkflows
++    override fun ReferenceToVideoUiState.withWorkflows(workflows: List<WorkflowItem>) = copy(availableWorkflows = workflows)
++
++    override fun onInitialize() {
++        super.onInitialize()
++        // Files of references from before a restart (the list itself isn't kept): nothing names them any more
++        val context = applicationContext ?: return
++        val kept = _uiState.value.references.map { it.file.name }.toSet()
++        viewModelScope.launch(Dispatchers.IO) {
++            File(context.cacheDir, CACHE_DIR).listFiles()?.filter { it.name !in kept }?.forEach { it.delete() }
++        }
++    }
++
++    override fun onClearShownMedia() {
++        super.onClearShownMedia()
++        clearReferences()
++    }
++
++    /** Ready with at least one image or video (audio alone isn't a reference MiniMax H3 can follow). */
++    override fun hasValidConfiguration(): Boolean {
++        val state = _uiState.value
++        return state.references.any { it.kind != ReferenceKind.AUDIO } && isReadyToGenerate(state.params)
++    }
++
++    fun onViewModeChange(mode: ReferenceToVideoViewMode) {
++        _uiState.update { it.copy(viewMode = mode) }
++    }
++
++    /** Put a reference's tag(s) at the end of the prompt. */
++    fun insertTag(item: ReferenceItem) {
++        val tags = _uiState.value.references.tags()[item.id]?.joinToString(" ") ?: return
++        val prompt = _uiState.value.params.positivePrompt
++        val separator = if (prompt.isEmpty() || prompt.endsWith(" ") || prompt.endsWith("\n")) "" else " "
++        onPositivePromptChange(prompt + separator + tags)
++    }
++
++    /** Pass a video's soundtrack on with it, or not. */
++    fun onReferenceSoundChange(id: String, withSound: Boolean) {
++        _uiState.update { state ->
++            state.copy(references = state.references.map { if (it.id == id && it.hasSound) it.copy(withSound = withSound) else it })
++        }
++    }
++
++    fun removeReference(id: String) {
++        val item = _uiState.value.references.firstOrNull { it.id == id } ?: return
++        _uiState.update { state -> state.copy(references = state.references.filterNot { it.id == id }) }
++        viewModelScope.launch(Dispatchers.IO) { item.file.delete() }
++    }
++
++    private fun clearReferences() {
++        val items = _uiState.value.references
++        _uiState.update { it.copy(references = emptyList()) }
++        viewModelScope.launch(Dispatchers.IO) { items.forEach { it.file.delete() } }
++    }
++
++    /** A file picked on the device as a reference of [kind]: copied to the cache, with a thumbnail where it has one. */
++    fun addReference(context: Context, uri: Uri, kind: ReferenceKind) {
++        val limitMessage = limitMessage(kind)
++        if (limitMessage != null) {
++            viewModelScope.launch { _events.emit(GenerationScreenEvent.ShowToast(limitMessage)) }
++            return
++        }
++        viewModelScope.launch(Dispatchers.IO) {
++            val item = try {
++                readReference(context, uri, kind)
++            } catch (e: Exception) {
++                DebugLogger.w(LOG_TAG, "Reference not read: ${e.javaClass.simpleName}")
++                null
++            }
++            if (item == null) {
++                _events.emit(GenerationScreenEvent.ShowToast(R.string.error_reference_unreadable))
++                return@launch
++            }
++            // Checked again: another pick may have filled the last place meanwhile
++            if (limitMessage(kind) != null) {
++                item.file.delete()
++                _events.emit(GenerationScreenEvent.ShowToast(limitMessage(kind)!!))
++                return@launch
++            }
++            _uiState.update { it.copy(references = it.references + item, viewMode = ReferenceToVideoViewMode.SOURCE) }
++        }
++    }
++
++    /** The message when no more references of [kind] fit; null while they do. */
++    private fun limitMessage(kind: ReferenceKind): Int? {
++        val count = _uiState.value.references.count { it.kind == kind }
++        return when (kind) {
++            ReferenceKind.IMAGE -> R.string.msg_reference_limit_images.takeIf { count >= MAX_IMAGES }
++            ReferenceKind.VIDEO -> R.string.msg_reference_limit_videos.takeIf { count >= MAX_VIDEOS }
++            ReferenceKind.AUDIO -> R.string.msg_reference_limit_audios.takeIf { count >= MAX_AUDIOS }
++        }
++    }
++
++    private suspend fun readReference(context: Context, uri: Uri, kind: ReferenceKind): ReferenceItem? {
++        val resolver = context.contentResolver
++        val name = resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
++            if (cursor.moveToFirst() && !cursor.isNull(0)) cursor.getString(0) else null
++        } ?: uri.lastPathSegment ?: kind.name.lowercase()
++        val dir = File(context.cacheDir, CACHE_DIR).apply { mkdirs() }
++        val id = UUID.randomUUID().toString()
++
++        if (kind == ReferenceKind.IMAGE) {
++            // Decoded and stored as PNG: any format the device reads reaches the server in one it reads
++            val decoded = SourceUploads.decodeImage(context, uri) ?: return null
++            // No larger than the model reads it, so a photo isn't uploaded at full size for nothing
++            val shortEdge = minOf(decoded.width, decoded.height)
++            val bitmap = if (shortEdge > IMAGE_MAX_SHORT_EDGE) {
++                val longer = maxOf(decoded.width, decoded.height)
++                scaled(decoded, (longer.toLong() * IMAGE_MAX_SHORT_EDGE / shortEdge).toInt()).also {
++                    if (it !== decoded) decoded.recycle()
++                }
++            } else {
++                decoded
++            }
++            val file = File(dir, "$id.png")
++            file.outputStream().use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
++            val thumbnail = scaled(bitmap, THUMB_MAX_PX)
++            if (thumbnail !== bitmap) bitmap.recycle()
++            return ReferenceItem(id, kind, file, "png", "image/png", name, thumbnail)
++        }
++
++        val declaredSize = resolver.query(uri, arrayOf(OpenableColumns.SIZE), null, null, null)?.use { cursor ->
++            if (cursor.moveToFirst() && !cursor.isNull(0)) cursor.getLong(0) else null
++        }
++        if (declaredSize != null && declaredSize > MAX_REFERENCE_BYTES) return null
++        val mimeType = resolver.getType(uri) ?: if (kind == ReferenceKind.VIDEO) "video/mp4" else "audio/mpeg"
++        val extension = MimeTypeMap.getSingleton().getExtensionFromMimeType(mimeType)?.takeIf { it.isNotEmpty() }
++            ?: name.substringAfterLast('.', "").lowercase().takeIf { it.isNotEmpty() && it.length <= 5 }
++            ?: if (kind == ReferenceKind.VIDEO) "mp4" else "mp3"
++        val file = File(dir, "$id.$extension")
++        val copied = resolver.openInputStream(uri)?.use { input ->
++            file.outputStream().use { output ->
++                var total = 0L
++                val buffer = ByteArray(64 * 1024)
++                while (true) {
++                    val read = input.read(buffer)
++                    if (read < 0) break
++                    total += read
++                    if (total > MAX_REFERENCE_BYTES) return@use false
++                    output.write(buffer, 0, read)
++                }
++                true
++            }
++        } ?: false
++        if (!copied) {
++            file.delete()
++            return null
++        }
++
++        return if (kind == ReferenceKind.VIDEO) {
++            val thumbnail = VideoFrames.firstFrame(context, Uri.fromFile(file), THUMB_MAX_PX)
++            val hasSound = hasAudioTrack(file)
++            ReferenceItem(id, kind, file, extension, mimeType, name, thumbnail, hasSound = hasSound, withSound = hasSound)
++        } else {
++            ReferenceItem(id, kind, file, extension, mimeType, name)
++        }
++    }
++
++    private fun scaled(bitmap: Bitmap, maxPx: Int): Bitmap {
++        val longer = maxOf(bitmap.width, bitmap.height)
++        if (longer <= maxPx) return bitmap
++        val scale = maxPx.toFloat() / longer
++        return Bitmap.createScaledBitmap(bitmap, (bitmap.width * scale).toInt().coerceAtLeast(1),
++            (bitmap.height * scale).toInt().coerceAtLeast(1), true)
++    }
++
++    private fun hasAudioTrack(file: File): Boolean {
++        val extractor = MediaExtractor()
++        return try {
++            extractor.setDataSource(file.absolutePath)
++            (0 until extractor.trackCount).any {
++                extractor.getTrackFormat(it).getString(MediaFormat.KEY_MIME)?.startsWith("audio/") == true
++            }
++        } catch (_: Exception) {
++            false
++        } finally {
++            extractor.release()
++        }
++    }
++
++    /**
++     * Upload the references to ComfyUI and prepare the workflow with them.
++     */
++    suspend fun prepareWorkflow(): String? {
++        val client = comfyUIClient ?: return null
++        val context = applicationContext ?: return null
++
++        // Check connection before uploading
++        val connected = suspendCoroutine { cont ->
++            ConnectionManager.ensureConnection(context) { success ->
++                cont.resumeWith(Result.success(success))
++            }
++        }
++        if (!connected) return null  // Dialog already shown by ensureConnection
++
++        val state = _uiState.value
++        val p = state.params
++        if (state.references.none { it.kind != ReferenceKind.AUDIO }) {
++            _events.emit(GenerationScreenEvent.ShowToast(
++                if (state.references.isEmpty()) R.string.msg_no_references else R.string.msg_audio_needs_visual
++            ))
++            return null
++        }
++        if (p.hasErrors) return null
++        // A workflow without MiniMax H3's reference node would run without the references, as if they weren't there
++        val workflowJson = WorkflowManager.getWorkflowById(p.selectedWorkflowId)?.jsonContent.orEmpty()
++        if (!workflowJson.contains("\"MiniMaxH3ReferenceToVideo\"")) {
++            _events.emit(GenerationScreenEvent.ShowToast(R.string.error_r2v_no_reference_node))
++            return null
++        }
++
++        _uiState.update { it.copy(isUploading = true) }
++        return try {
++            val uploaded = mutableListOf<WorkflowManager.WorkflowReference>()
++            for (item in state.references) {
++                val bytes = withContext(Dispatchers.IO) { runCatching { item.file.readBytes() }.getOrNull() } ?: run {
++                    _events.emit(GenerationScreenEvent.ShowToast(R.string.error_reference_unreadable))
++                    return null
++                }
++                // Named by content: a reference sent before isn't sent again
++                val result = SourceUploads.bytes(client, "r2v_ref", bytes, item.extension, item.mimeType)
++                val filename = result.filename ?: run {
++                    if (!SourceUploads.alertIfConnection(context, result.failure)) {
++                        _events.emit(GenerationScreenEvent.ShowToast(R.string.error_upload_reference))
++                    }
++                    return null
++                }
++                uploaded += WorkflowManager.WorkflowReference(item.kind, filename, withSound = item.withSound)
++            }
++
++            WorkflowManager.prepareWorkflow(
++                p.selectedWorkflowId, withSubmittedSeed(p), WorkflowManager.WorkflowImages(references = uploaded)
++            )
++        } finally {
++            _uiState.update { it.copy(isUploading = false) }
++        }
++    }
++}
+diff --git a/app/src/main/java/sh/hnet/comfychair/viewmodel/SettingsViewModel.kt b/app/src/main/java/sh/hnet/comfychair/viewmodel/SettingsViewModel.kt
+index 1b38177..dc4ec1d 100644
+--- a/app/src/main/java/sh/hnet/comfychair/viewmodel/SettingsViewModel.kt
++++ b/app/src/main/java/sh/hnet/comfychair/viewmodel/SettingsViewModel.kt
+@@ -399,7 +399,8 @@ class SettingsViewModel : ViewModel() {
+                     "ImageToImageFragmentPrefs",
+                     "TextToVideoFragmentPrefs",
+                     "ImageToVideoFragmentPrefs",
+-                    "VideoToVideoFragmentPrefs"
++                    "VideoToVideoFragmentPrefs",
++                    "ReferenceToVideoFragmentPrefs"
+                 ).forEach { prefsName ->
+                     context.getSharedPreferences(prefsName, Context.MODE_PRIVATE).edit().clear().commit()
+                 }
+@@ -441,7 +442,8 @@ class SettingsViewModel : ViewModel() {
+                     "ImageToImageFragmentPrefs",
+                     "TextToVideoFragmentPrefs",
+                     "ImageToVideoFragmentPrefs",
+-                    "VideoToVideoFragmentPrefs"
++                    "VideoToVideoFragmentPrefs",
++                    "ReferenceToVideoFragmentPrefs"
+                 )
+ 
+                 for (prefName in prefNames) {
 diff --git a/app/src/main/java/sh/hnet/comfychair/viewmodel/WorkflowEditorViewModel.kt b/app/src/main/java/sh/hnet/comfychair/viewmodel/WorkflowEditorViewModel.kt
 index 1d5f456..4e66233 100644
 --- a/app/src/main/java/sh/hnet/comfychair/viewmodel/WorkflowEditorViewModel.kt
@@ -171,10 +1703,38 @@ index 1d5f456..4e66233 100644
  
                  DebugLogger.d(TAG, "proceedWithEditExistingSave: All nodes validated, creating field mappings")
 diff --git a/app/src/main/java/sh/hnet/comfychair/viewmodel/WorkflowManagementViewModel.kt b/app/src/main/java/sh/hnet/comfychair/viewmodel/WorkflowManagementViewModel.kt
-index bdb7086..fcf8fb6 100644
+index bdb7086..7d6e1ce 100644
 --- a/app/src/main/java/sh/hnet/comfychair/viewmodel/WorkflowManagementViewModel.kt
 +++ b/app/src/main/java/sh/hnet/comfychair/viewmodel/WorkflowManagementViewModel.kt
-@@ -381,13 +381,26 @@ class WorkflowManagementViewModel : ViewModel() {
+@@ -52,7 +52,8 @@ enum class WorkflowFilter(val types: Set<WorkflowType>) {
+     ITI(setOf(WorkflowType.ITI_EDITING, WorkflowType.ITI_INPAINTING)),
+     TTV(setOf(WorkflowType.TTV)),
+     ITV(setOf(WorkflowType.ITV)),
+-    V2V(setOf(WorkflowType.V2V))
++    V2V(setOf(WorkflowType.V2V)),
++    R2V(setOf(WorkflowType.R2V))
+ }
+ 
+ /**
+@@ -66,6 +67,7 @@ data class WorkflowManagementUiState(
+     val ttvWorkflows: List<WorkflowManager.Workflow> = emptyList(),
+     val itvWorkflows: List<WorkflowManager.Workflow> = emptyList(),
+     val v2vWorkflows: List<WorkflowManager.Workflow> = emptyList(),
++    val r2vWorkflows: List<WorkflowManager.Workflow> = emptyList(),
+     // Workflows switched off by the user (not offered on the generation screens)
+     val disabledWorkflowIds: Set<String> = emptySet(),
+     // Types shown; kept while the app runs (the view model belongs to the activity), not saved
+@@ -186,7 +188,8 @@ class WorkflowManagementViewModel : ViewModel() {
+             itiEditingWorkflows = WorkflowManager.getWorkflowsByType(WorkflowType.ITI_EDITING),
+             ttvWorkflows = WorkflowManager.getWorkflowsByType(WorkflowType.TTV),
+             itvWorkflows = WorkflowManager.getWorkflowsByType(WorkflowType.ITV),
+-            v2vWorkflows = WorkflowManager.getWorkflowsByType(WorkflowType.V2V)
++            v2vWorkflows = WorkflowManager.getWorkflowsByType(WorkflowType.V2V),
++            r2vWorkflows = WorkflowManager.getWorkflowsByType(WorkflowType.R2V)
+         )
+     }
+ 
+@@ -381,13 +384,26 @@ class WorkflowManagementViewModel : ViewModel() {
                  // Validate nodes
                  val missingNodes = WorkflowManager.validateNodesAgainstServer(workflowClassTypes, availableNodes)
                  if (missingNodes.isNotEmpty()) {
@@ -206,3 +1766,461 @@ index bdb7086..fcf8fb6 100644
                  }
  
                  // Validate required fields for type
+diff --git a/app/src/main/java/sh/hnet/comfychair/workflow/TemplateKeyRegistry.kt b/app/src/main/java/sh/hnet/comfychair/workflow/TemplateKeyRegistry.kt
+index 0ea0ad1..a40c4b3 100644
+--- a/app/src/main/java/sh/hnet/comfychair/workflow/TemplateKeyRegistry.kt
++++ b/app/src/main/java/sh/hnet/comfychair/workflow/TemplateKeyRegistry.kt
+@@ -110,7 +110,9 @@ object TemplateKeyRegistry {
+         WorkflowType.ITI_EDITING to setOf("image"),
+         WorkflowType.TTV to emptySet(),
+         WorkflowType.ITV to setOf("image"),
+-        WorkflowType.V2V to setOf("video")
++        WorkflowType.V2V to setOf("video"),
++        // References are wired in by the app when generating, so no field is required
++        WorkflowType.R2V to emptySet()
+     )
+ 
+     /**
+@@ -139,7 +141,8 @@ object TemplateKeyRegistry {
+         WorkflowType.ITI_EDITING to UNIVERSAL_OPTIONAL_KEYS,
+         WorkflowType.TTV to UNIVERSAL_OPTIONAL_KEYS,
+         WorkflowType.ITV to UNIVERSAL_OPTIONAL_KEYS,
+-        WorkflowType.V2V to UNIVERSAL_OPTIONAL_KEYS
++        WorkflowType.V2V to UNIVERSAL_OPTIONAL_KEYS,
++        WorkflowType.R2V to UNIVERSAL_OPTIONAL_KEYS
+     )
+ 
+     /**
+diff --git a/app/src/main/res/raw/r2v_minimax_h3.json b/app/src/main/res/raw/r2v_minimax_h3.json
+new file mode 100644
+index 0000000..4e66f42
+--- /dev/null
++++ b/app/src/main/res/raw/r2v_minimax_h3.json
+@@ -0,0 +1,252 @@
++{
++  "name": "MiniMax H3",
++  "description": "Workflow for MiniMax H3 reference to video (images, videos and audio as references) with native stereo sound",
++  "defaults": {
++    "steps": 20,
++    "sampler_name": "res_multistep",
++    "scheduler": "simple",
++    "width": 480,
++    "height": 864,
++    "length": 124
++  },
++  "groups": [
++    {
++      "id": 1,
++      "title": "Model Loaders",
++      "member_nodes": [
++        "10",
++        "11",
++        "12",
++        "13",
++        "note:1"
++      ]
++    },
++    {
++      "id": 3,
++      "title": "References",
++      "member_nodes": [
++        "7",
++        "note:2"
++      ]
++    }
++  ],
++  "notes": [
++    {
++      "id": 1,
++      "title": "Model Selection",
++      "content": "### Recommended Models\n\n- **Diffusion model:** **MiniMax H3 REF2VA** (reference to video, Int8)\n- **Text encoder:** **Qwen3-VL 32B** for MiniMax H3 (NVFP4 AWQ)\n- **VAE:** the MiniMax H3 **video** VAE\n- **Audio VAE:** the MiniMax H3 **audio** VAE\n\n---\n\n*MiniMax H3 generates the picture and its stereo sound together, at 24 fps.*"
++    },
++    {
++      "id": 2,
++      "title": "References",
++      "content": "### How It Works\n\nThe references chosen on the screen are wired into **Reference to Video** when generating: up to **9 images**, **3 videos** (their first 15 seconds, with their sound if you keep it) and **3 audio clips**.\n\n- Each reference has a tag: **<Picture N>**, **<Video N>**, **<Audio N>**. Tap a reference to put its tag in the prompt; a reference the prompt doesn't name is ignored.\n- A video's sound is numbered before the standalone audio clips.\n- **Size:** 480 x 864 for speed, up to 768 x 1344 (multiples of 32)\n- **Length:** 124 frames (~5 s at 24 fps); 5 + 17n\n\n---\n\n*Audio alone isn't enough: add at least one image or video. MiniMax H3 uses no negative prompt.*"
++    }
++  ],
++  "nodes": {
++    "7": {
++      "class_type": "MiniMaxH3ReferenceToVideo",
++      "inputs": {
++        "clip": [
++          "11",
++          0
++        ],
++        "vae": [
++          "12",
++          0
++        ],
++        "audio_vae": [
++          "13",
++          0
++        ],
++        "prompt": "{{positive_prompt}}",
++        "width": "{{width}}",
++        "height": "{{height}}",
++        "length": "{{length}}",
++        "ref_image_size": "match"
++      },
++      "_meta": {
++        "title": "Reference to Video"
++      }
++    },
++    "10": {
++      "class_type": "UNETLoader",
++      "inputs": {
++        "unet_name": "{{unet_name}}",
++        "weight_dtype": "default"
++      },
++      "_meta": {
++        "title": "Load Diffusion Model"
++      }
++    },
++    "11": {
++      "class_type": "CLIPLoader",
++      "inputs": {
++        "clip_name": "{{clip_name}}",
++        "type": "minimax",
++        "device": "default"
++      },
++      "_meta": {
++        "title": "Load Text Encoder"
++      }
++    },
++    "12": {
++      "class_type": "VAELoader",
++      "inputs": {
++        "vae_name": "{{vae_name}}"
++      },
++      "_meta": {
++        "title": "Load Video VAE"
++      }
++    },
++    "13": {
++      "class_type": "VAELoader",
++      "inputs": {
++        "vae_name": "{{audio_vae_name}}"
++      },
++      "_meta": {
++        "title": "Load Audio VAE"
++      }
++    },
++    "20": {
++      "class_type": "RandomNoise",
++      "inputs": {
++        "noise_seed": "{{seed}}"
++      },
++      "_meta": {
++        "title": "Noise"
++      }
++    },
++    "21": {
++      "class_type": "BasicGuider",
++      "inputs": {
++        "model": [
++          "10",
++          0
++        ],
++        "conditioning": [
++          "7",
++          0
++        ]
++      },
++      "_meta": {
++        "title": "Guider"
++      }
++    },
++    "22": {
++      "class_type": "KSamplerSelect",
++      "inputs": {
++        "sampler_name": "{{sampler_name}}"
++      },
++      "_meta": {
++        "title": "Sampler"
++      }
++    },
++    "23": {
++      "class_type": "BasicScheduler",
++      "inputs": {
++        "model": [
++          "10",
++          0
++        ],
++        "scheduler": "{{scheduler}}",
++        "steps": "{{steps}}",
++        "denoise": 1.0
++      },
++      "_meta": {
++        "title": "Scheduler"
++      }
++    },
++    "24": {
++      "class_type": "SamplerCustomAdvanced",
++      "inputs": {
++        "noise": [
++          "20",
++          0
++        ],
++        "guider": [
++          "21",
++          0
++        ],
++        "sampler": [
++          "22",
++          0
++        ],
++        "sigmas": [
++          "23",
++          0
++        ],
++        "latent_image": [
++          "7",
++          1
++        ]
++      },
++      "_meta": {
++        "title": "Sample"
++      }
++    },
++    "25": {
++      "class_type": "VAEDecode",
++      "inputs": {
++        "samples": [
++          "24",
++          0
++        ],
++        "vae": [
++          "12",
++          0
++        ]
++      },
++      "_meta": {
++        "title": "Decode Video"
++      }
++    },
++    "26": {
++      "class_type": "VAEDecodeAudio",
++      "inputs": {
++        "samples": [
++          "24",
++          0
++        ],
++        "vae": [
++          "13",
++          0
++        ]
++      },
++      "_meta": {
++        "title": "Decode Audio"
++      }
++    },
++    "27": {
++      "class_type": "CreateVideo",
++      "inputs": {
++        "images": [
++          "25",
++          0
++        ],
++        "audio": [
++          "26",
++          0
++        ],
++        "fps": 24
++      },
++      "_meta": {
++        "title": "Create Video"
++      }
++    },
++    "28": {
++      "class_type": "SaveVideo",
++      "inputs": {
++        "filename_prefix": "video/ComfyChair",
++        "format": "auto",
++        "codec": "auto",
++        "video": [
++          "27",
++          0
++        ]
++      },
++      "_meta": {
++        "title": "Save Video"
++      }
++    }
++  }
++}
+\ No newline at end of file
+diff --git a/app/src/main/res/values-de/strings.xml b/app/src/main/res/values-de/strings.xml
+index c56bada..529df00 100644
+--- a/app/src/main/res/values-de/strings.xml
++++ b/app/src/main/res/values-de/strings.xml
+@@ -1161,4 +1161,24 @@
+     <string name="sg_remove_output">Ausgang entfernen</string>
+     <string name="sg_connect_hint_inputs">Tippe auf einen hervorgehobenen Ausgang oder eine Hinzufügen-Buchse</string>
+     <string name="sg_connect_hint_outputs">Tippe auf einen hervorgehobenen Eingang oder eine Hinzufügen-Buchse</string>
++
++    <!-- Reference to Video -->
++    <string name="workflow_section_r2v">Referenzen zu Video</string>
++    <string name="nav_reference_to_video">Referenzen zu Video</string>
++    <string name="screen_type_reference_to_video">Referenzen zu Video</string>
++    <string name="label_source_references">Refs</string>
++    <string name="button_add_image_reference">Bild</string>
++    <string name="button_add_video_reference">Video</string>
++    <string name="button_add_audio_reference">Audio</string>
++    <string name="label_r2v_hint">Bilder, Videos oder Audio hinzufügen, dann antippen, um das Tag in den Prompt zu setzen</string>
++    <string name="msg_no_references">Mindestens ein Bild oder Video als Referenz hinzufügen</string>
++    <string name="msg_audio_needs_visual">Audio braucht auch ein Bild oder Video</string>
++    <string name="msg_reference_limit_images">Höchstens 9 Bildreferenzen</string>
++    <string name="msg_reference_limit_videos">Höchstens 3 Videoreferenzen</string>
++    <string name="msg_reference_limit_audios">Höchstens 3 Audioreferenzen</string>
++    <string name="error_reference_unreadable">Die Datei konnte nicht gelesen werden</string>
++    <string name="error_upload_reference">Eine Referenz konnte nicht hochgeladen werden</string>
++    <string name="content_description_remove_reference">Referenz entfernen</string>
++    <string name="label_reference_video_sound">Ton</string>
++    <string name="error_r2v_no_reference_node">Dieser Workflow hat keinen MiniMax-H3-Reference-to-Video-Knoten und kann keine Referenzen nutzen</string>
+ </resources>
+diff --git a/app/src/main/res/values-es/strings.xml b/app/src/main/res/values-es/strings.xml
+index 8156a16..e06bbfe 100644
+--- a/app/src/main/res/values-es/strings.xml
++++ b/app/src/main/res/values-es/strings.xml
+@@ -1194,4 +1194,24 @@
+     <string name="sg_remove_output">Quitar salida</string>
+     <string name="sg_connect_hint_inputs">Toca una salida resaltada o una toma «añadir»</string>
+     <string name="sg_connect_hint_outputs">Toca una entrada resaltada o una toma «añadir»</string>
++
++    <!-- Reference to Video -->
++    <string name="workflow_section_r2v">Referencias a vídeo</string>
++    <string name="nav_reference_to_video">Referencias a vídeo</string>
++    <string name="screen_type_reference_to_video">Referencias a vídeo</string>
++    <string name="label_source_references">Refs</string>
++    <string name="button_add_image_reference">Imagen</string>
++    <string name="button_add_video_reference">Vídeo</string>
++    <string name="button_add_audio_reference">Audio</string>
++    <string name="label_r2v_hint">Añade imágenes, vídeos o audio y toca uno para poner su etiqueta en el prompt</string>
++    <string name="msg_no_references">Añade al menos una imagen o un vídeo de referencia</string>
++    <string name="msg_audio_needs_visual">El audio necesita también una imagen o un vídeo</string>
++    <string name="msg_reference_limit_images">Hasta 9 imágenes de referencia</string>
++    <string name="msg_reference_limit_videos">Hasta 3 vídeos de referencia</string>
++    <string name="msg_reference_limit_audios">Hasta 3 audios de referencia</string>
++    <string name="error_reference_unreadable">No se pudo leer el archivo</string>
++    <string name="error_upload_reference">No se pudo subir una referencia</string>
++    <string name="content_description_remove_reference">Quitar referencia</string>
++    <string name="label_reference_video_sound">Sonido</string>
++    <string name="error_r2v_no_reference_node">Este flujo de trabajo no tiene un nodo MiniMax H3 Reference to Video, así que no puede usar referencias</string>
+ </resources>
+diff --git a/app/src/main/res/values-fr/strings.xml b/app/src/main/res/values-fr/strings.xml
+index 7ba9da1..fcad019 100644
+--- a/app/src/main/res/values-fr/strings.xml
++++ b/app/src/main/res/values-fr/strings.xml
+@@ -1194,4 +1194,24 @@
+     <string name="sg_remove_output">Supprimer la sortie</string>
+     <string name="sg_connect_hint_inputs">Touchez une sortie mise en évidence ou une prise « ajouter »</string>
+     <string name="sg_connect_hint_outputs">Touchez une entrée mise en évidence ou une prise « ajouter »</string>
++
++    <!-- Reference to Video -->
++    <string name="workflow_section_r2v">Références vers vidéo</string>
++    <string name="nav_reference_to_video">Références vers vidéo</string>
++    <string name="screen_type_reference_to_video">Références vers vidéo</string>
++    <string name="label_source_references">Réfs</string>
++    <string name="button_add_image_reference">Image</string>
++    <string name="button_add_video_reference">Vidéo</string>
++    <string name="button_add_audio_reference">Audio</string>
++    <string name="label_r2v_hint">Ajoutez des images, vidéos ou sons, puis touchez-en un pour mettre son étiquette dans le prompt</string>
++    <string name="msg_no_references">Ajoutez au moins une image ou une vidéo de référence</string>
++    <string name="msg_audio_needs_visual">L\'audio doit être accompagné d\'une image ou d\'une vidéo</string>
++    <string name="msg_reference_limit_images">9 images de référence au maximum</string>
++    <string name="msg_reference_limit_videos">3 vidéos de référence au maximum</string>
++    <string name="msg_reference_limit_audios">3 sons de référence au maximum</string>
++    <string name="error_reference_unreadable">Le fichier n\'a pas pu être lu</string>
++    <string name="error_upload_reference">Une référence n\'a pas pu être téléversée</string>
++    <string name="content_description_remove_reference">Retirer la référence</string>
++    <string name="label_reference_video_sound">Son</string>
++    <string name="error_r2v_no_reference_node">Ce workflow n\'a pas de nœud MiniMax H3 Reference to Video : il ne peut pas utiliser de références</string>
+ </resources>
+diff --git a/app/src/main/res/values-pl/strings.xml b/app/src/main/res/values-pl/strings.xml
+index 007f98f..738697c 100644
+--- a/app/src/main/res/values-pl/strings.xml
++++ b/app/src/main/res/values-pl/strings.xml
+@@ -1225,4 +1225,24 @@
+     <string name="sg_remove_output">Usuń wyjście</string>
+     <string name="sg_connect_hint_inputs">Dotknij podświetlonego wyjścia albo gniazda „dodaj”</string>
+     <string name="sg_connect_hint_outputs">Dotknij podświetlonego wejścia albo gniazda „dodaj”</string>
++
++    <!-- Reference to Video -->
++    <string name="workflow_section_r2v">Referencje na wideo</string>
++    <string name="nav_reference_to_video">Referencje na wideo</string>
++    <string name="screen_type_reference_to_video">Referencje na wideo</string>
++    <string name="label_source_references">Ref.</string>
++    <string name="button_add_image_reference">Obraz</string>
++    <string name="button_add_video_reference">Wideo</string>
++    <string name="button_add_audio_reference">Audio</string>
++    <string name="label_r2v_hint">Dodaj obrazy, wideo lub audio, potem dotknij, aby wstawić tag do promptu</string>
++    <string name="msg_no_references">Dodaj co najmniej jeden obraz lub wideo referencyjne</string>
++    <string name="msg_audio_needs_visual">Audio wymaga też obrazu lub wideo</string>
++    <string name="msg_reference_limit_images">Maksymalnie 9 obrazów referencyjnych</string>
++    <string name="msg_reference_limit_videos">Maksymalnie 3 wideo referencyjne</string>
++    <string name="msg_reference_limit_audios">Maksymalnie 3 audio referencyjne</string>
++    <string name="error_reference_unreadable">Nie udało się odczytać pliku</string>
++    <string name="error_upload_reference">Nie udało się wysłać referencji</string>
++    <string name="content_description_remove_reference">Usuń referencję</string>
++    <string name="label_reference_video_sound">Dźwięk</string>
++    <string name="error_r2v_no_reference_node">Ten workflow nie ma węzła MiniMax H3 Reference to Video, więc nie może użyć referencji</string>
+ </resources>
+diff --git a/app/src/main/res/values-zh/strings.xml b/app/src/main/res/values-zh/strings.xml
+index 054ce22..29357b8 100644
+--- a/app/src/main/res/values-zh/strings.xml
++++ b/app/src/main/res/values-zh/strings.xml
+@@ -1132,4 +1132,24 @@
+     <string name="sg_remove_output">移除输出</string>
+     <string name="sg_connect_hint_inputs">点按高亮的输出或“添加”插口</string>
+     <string name="sg_connect_hint_outputs">点按高亮的输入或“添加”插口</string>
++
++    <!-- Reference to Video -->
++    <string name="workflow_section_r2v">参考生视频</string>
++    <string name="nav_reference_to_video">参考生视频</string>
++    <string name="screen_type_reference_to_video">参考生视频</string>
++    <string name="label_source_references">参考</string>
++    <string name="button_add_image_reference">图片</string>
++    <string name="button_add_video_reference">视频</string>
++    <string name="button_add_audio_reference">音频</string>
++    <string name="label_r2v_hint">添加图片、视频或音频，点按即可将其标签插入提示词</string>
++    <string name="msg_no_references">请至少添加一张参考图片或一段参考视频</string>
++    <string name="msg_audio_needs_visual">音频需要同时有图片或视频参考</string>
++    <string name="msg_reference_limit_images">最多 9 张参考图片</string>
++    <string name="msg_reference_limit_videos">最多 3 段参考视频</string>
++    <string name="msg_reference_limit_audios">最多 3 段参考音频</string>
++    <string name="error_reference_unreadable">无法读取该文件</string>
++    <string name="error_upload_reference">无法上传参考文件</string>
++    <string name="content_description_remove_reference">移除参考</string>
++    <string name="label_reference_video_sound">声音</string>
++    <string name="error_r2v_no_reference_node">此工作流没有 MiniMax H3 Reference to Video 节点，无法使用参考</string>
+ </resources>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index c681ba6..57016d3 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -1193,4 +1193,24 @@
+     <string name="sg_remove_output">Remove output</string>
+     <string name="sg_connect_hint_inputs">Tap a highlighted output or an add socket</string>
+     <string name="sg_connect_hint_outputs">Tap a highlighted input or an add socket</string>
++
++    <!-- Reference to Video -->
++    <string name="workflow_section_r2v">Reference to Video</string>
++    <string name="nav_reference_to_video">Reference to Video</string>
++    <string name="screen_type_reference_to_video">Reference to Video</string>
++    <string name="label_source_references">Refs</string>
++    <string name="button_add_image_reference">Image</string>
++    <string name="button_add_video_reference">Video</string>
++    <string name="button_add_audio_reference">Audio</string>
++    <string name="label_r2v_hint">Add images, videos or audio, then tap one to put its tag in the prompt</string>
++    <string name="msg_no_references">Add at least one image or video reference</string>
++    <string name="msg_audio_needs_visual">Audio needs an image or video reference too</string>
++    <string name="msg_reference_limit_images">Up to 9 image references</string>
++    <string name="msg_reference_limit_videos">Up to 3 video references</string>
++    <string name="msg_reference_limit_audios">Up to 3 audio references</string>
++    <string name="error_reference_unreadable">The file couldn\'t be read</string>
++    <string name="error_upload_reference">A reference couldn\'t be uploaded</string>
++    <string name="content_description_remove_reference">Remove reference</string>
++    <string name="label_reference_video_sound">Sound</string>
++    <string name="error_r2v_no_reference_node">This workflow has no MiniMax H3 Reference to Video node, so it can\'t use references</string>
+ </resources>
