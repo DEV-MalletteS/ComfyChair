@@ -134,6 +134,42 @@ index 598b047..666fe51 100644
  
          return when {
              // Video-to-video: loads a video (most specific: such workflows also have video nodes)
+diff --git a/app/src/main/java/sh/hnet/comfychair/viewmodel/WorkflowEditorViewModel.kt b/app/src/main/java/sh/hnet/comfychair/viewmodel/WorkflowEditorViewModel.kt
+index 1d5f456..4e66233 100644
+--- a/app/src/main/java/sh/hnet/comfychair/viewmodel/WorkflowEditorViewModel.kt
++++ b/app/src/main/java/sh/hnet/comfychair/viewmodel/WorkflowEditorViewModel.kt
+@@ -993,13 +993,8 @@ class WorkflowEditorViewModel : ViewModel() {
+                 val missingNodes = workflowClassTypes.filter { it !in availableNodes }
+ 
+                 if (missingNodes.isNotEmpty()) {
+-                    DebugLogger.w(TAG, "proceedWithSave: Missing nodes: $missingNodes")
+-                    _uiState.value = _uiState.value.copy(
+-                        isSaveValidating = false,
+-                        showMissingNodesDialog = true,
+-                        missingNodes = missingNodes
+-                    )
+-                    return@launch
++                    // Saving is allowed with nodes the server lacks: the editor is where they get fixed or removed
++                    DebugLogger.w(TAG, "proceedWithSave: Missing nodes (save continues): $missingNodes")
+                 }
+ 
+                 DebugLogger.d(TAG, "proceedWithSave: All nodes validated, creating field mappings")
+@@ -1102,13 +1097,8 @@ class WorkflowEditorViewModel : ViewModel() {
+                 val missingNodes = workflowClassTypes.filter { it !in availableNodes }
+ 
+                 if (missingNodes.isNotEmpty()) {
+-                    DebugLogger.w(TAG, "proceedWithEditExistingSave: Missing nodes: $missingNodes")
+-                    _uiState.value = _uiState.value.copy(
+-                        isSaveValidating = false,
+-                        showMissingNodesDialog = true,
+-                        missingNodes = missingNodes
+-                    )
+-                    return@launch
++                    // Saving is allowed with nodes the server lacks: the editor is where they get fixed or removed
++                    DebugLogger.w(TAG, "proceedWithEditExistingSave: Missing nodes (save continues): $missingNodes")
+                 }
+ 
+                 DebugLogger.d(TAG, "proceedWithEditExistingSave: All nodes validated, creating field mappings")
 diff --git a/app/src/main/java/sh/hnet/comfychair/viewmodel/WorkflowManagementViewModel.kt b/app/src/main/java/sh/hnet/comfychair/viewmodel/WorkflowManagementViewModel.kt
 index bdb7086..fcf8fb6 100644
 --- a/app/src/main/java/sh/hnet/comfychair/viewmodel/WorkflowManagementViewModel.kt
