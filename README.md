@@ -1,25 +1,47 @@
 # ComfyChair (modded fork)
 
-Unofficial fork of [legal-hkr/comfychair](https://github.com/legal-hkr/comfychair) v0.9.6. All credit for the app goes to the original author. Changes are in `comfychair-relaxed-import-gguf.patch`.
+Unofficial fork of [legal-hkr/comfychair](https://github.com/legal-hkr/comfychair) v0.9.6. All credit for the app goes to the original author. Every change lives in one file, `comfychair-relaxed-import-gguf.patch`, which is applied at build time.
 
-## Changes
+## What's different
 
-- **Import with missing nodes:** nodes the server doesn't have are removed, along with any inputs wired to them, and the rest of the workflow imports. Each removal is listed in the import notes. Workflows with subgraphs still use the original blocking dialog.
-- **GGUF support:**
-  - Any `Unet*` loader (e.g. `UnetLoaderGGUF`) is recognised as a diffusion-model loader during type detection.
-  - Model dropdowns on `UNETLoader` and CLIP loaders also list GGUF files.
-  - At submit, a `.gguf` selection swaps the loader to its GGUF twin (`UNETLoader`, `CLIPLoader`, `DualCLIPLoader`, `TripleCLIPLoader`, `QuadrupleCLIPLoader`), and swaps back for other files. This only happens if the twin node exists on the server (ComfyUI-GGUF).
+### Reference to Video (new mode)
+A native **Refs** option on the Video tab, alongside Text, Image and Video, for MiniMax H3's reference-to-video model (ref2va).
+
+- Add up to **9 images**, **3 videos** and **3 audio clips** as references, from your device.
+- Each reference shows its prompt tag: `<Picture N>`, `<Video N>` or `<Audio N>`. Tap one to put its tag in the prompt. MiniMax H3 ignores references that the prompt doesn't name.
+- A video's soundtrack can be kept or dropped. Kept soundtracks take `<Audio N>` numbers before standalone audio clips, matching how ComfyUI presents them to the model.
+- When you generate, references are uploaded and wired into the workflow's `MiniMaxH3ReferenceToVideo` node (ComfyUI core). This replaces whatever references the workflow came with.
+- Images are scaled down to a 2048 px short edge before upload, which is the most the model reads. Videos are trimmed to their first 15 seconds on the server.
+- Includes a bundled **MiniMax H3** Reference to Video workflow. Select the REF2VA diffusion model in it.
+- Imported workflows that contain `MiniMaxH3ReferenceToVideo` are detected as Reference to Video automatically. They also get their own filter and section on the Workflows page.
+
+### Imports no longer blocked by missing nodes
+- Nodes your server doesn't have are removed, along with any inputs wired to them, and the rest of the workflow imports. Each removal is listed in the import notes.
+- The workflow editor can save a workflow that still contains missing nodes, so you can rebuild the gap in the app.
+- Workflows with subgraphs still use the original blocking dialog.
+
+### GGUF support
+- Any `Unet*` loader (e.g. `UnetLoaderGGUF`) counts as a diffusion-model loader during type detection.
+- Model dropdowns on `UNETLoader` and the CLIP loaders also list GGUF files.
+- At submit, picking a `.gguf` file swaps the loader to its GGUF twin, and picking a non-GGUF file swaps it back. This covers `UNETLoader`, `CLIPLoader`, `DualCLIPLoader`, `TripleCLIPLoader` and `QuadrupleCLIPLoader`. The swap only happens if the twin node exists on your server (ComfyUI-GGUF).
+
+## Requirements
+- A ComfyUI version with the MiniMax H3 nodes, for Reference to Video
+- ComfyUI-GGUF, only for GGUF models
+
+## Known limits
+- References aren't kept after the app restarts.
+- Some audio formats (e.g. `.ogg`/`.opus` voice messages) may be rejected by ComfyUI's `LoadAudio`. Use mp3 or wav if that happens.
+- Reference to Video drives the core ComfyUI node only, not custom director nodes (e.g. DaSiWa's MiniMaxH3Director).
+- At least one image or video reference is required. Audio alone won't generate.
 
 ## Status
-
-Untested. The patch was written from the source and has not been compiled or run on a device. The CLIP-loader swap in particular is unverified.
+Experimental. The Reference to Video mode hasn't been confirmed by a successful build or a device test yet. The import and GGUF changes build successfully, but the GGUF CLIP-loader swap is still untested on a device.
 
 ## Install
-
-Run **Actions → Build modded APK → Run workflow**, then download the `comfychair-mod-apk` artifact. The app ID is `sh.hnet.comfychair.mod`, so it installs alongside the original. It is signed with the debug key.
+Run **Actions → Build modded APK → Run workflow**, then download the APK. The app ID is `sh.hnet.comfychair.mod`, so it installs alongside the original. It's signed with the debug key, so updates install over the previous mod build.
 
 ## License
-
 Same as upstream (see `LICENSE`).
 
 # <img src="metadata/en-US/icon.png" width="42"/> ComfyChair
