@@ -1,3 +1,54 @@
+diff --git a/app/src/main/java/sh/hnet/comfychair/ComfyUIClient.kt b/app/src/main/java/sh/hnet/comfychair/ComfyUIClient.kt
+index 7bdb2ba..46825b6 100644
+--- a/app/src/main/java/sh/hnet/comfychair/ComfyUIClient.kt
++++ b/app/src/main/java/sh/hnet/comfychair/ComfyUIClient.kt
+@@ -622,6 +622,46 @@ class ComfyUIClient(
+         })
+     }
+ 
++    /**
++     * The server's console log: what ComfyUI's terminal shows (loading, sampling steps with their progress bars,
++     * warnings, errors), from its /internal/logs/raw endpoint. Progress bars redrawn in place (carriage returns) are
++     * shown as their latest state, as a terminal shows them.
++     *
++     * The endpoint serves ComfyUI's own frontend and isn't a stable API: a server without it gives an error.
++     *
++     * @param callback The log's lines, or null and an error message
++     */
++    fun fetchServerLog(callback: (lines: List<String>?, error: String?) -> Unit) {
++        val baseUrl = getBaseUrl() ?: run {
++            callback(null, context?.getString(R.string.error_no_connection) ?: "No connection to server")
++            return
++        }
++        val request = Request.Builder().url("$baseUrl/internal/logs/raw").get().build()
++        httpClient.newCall(request).enqueue(object : okhttp3.Callback {
++            override fun onFailure(call: okhttp3.Call, e: IOException) {
++                callback(null, e.message ?: e.javaClass.simpleName)
++            }
++
++            override fun onResponse(call: okhttp3.Call, response: Response) {
++                response.use {
++                    if (!response.isSuccessful) {
++                        callback(null, "HTTP ${response.code}")
++                        return
++                    }
++                    try {
++                        val entries = JSONObject(response.body.string()).optJSONArray("entries") ?: JSONArray()
++                        val text = StringBuilder()
++                        for (i in 0 until entries.length()) text.append(entries.optJSONObject(i)?.optString("m").orEmpty())
++                        val lines = text.toString().split('\n').map { it.substringAfterLast('\r') }
++                        callback(lines.dropLastWhile { it.isEmpty() }, null)
++                    } catch (e: Exception) {
++                        callback(null, e.javaClass.simpleName)
++                    }
++                }
++            }
++        })
++    }
++
+     /**
+      * Fetch available diffusion models (UNET) from the ComfyUI server
+      * Retrieves the list of diffusion models that can be used for generation
 diff --git a/app/src/main/java/sh/hnet/comfychair/MainContainerActivity.kt b/app/src/main/java/sh/hnet/comfychair/MainContainerActivity.kt
 index 492de7f..9e11a93 100644
 --- a/app/src/main/java/sh/hnet/comfychair/MainContainerActivity.kt
@@ -495,8 +546,399 @@ index 43103f1..8d65777 100644
          )
  
          var totalRemoved = 0
+diff --git a/app/src/main/java/sh/hnet/comfychair/storage/PromptHistoryStorage.kt b/app/src/main/java/sh/hnet/comfychair/storage/PromptHistoryStorage.kt
+new file mode 100644
+index 0000000..2e1eb0c
+--- /dev/null
++++ b/app/src/main/java/sh/hnet/comfychair/storage/PromptHistoryStorage.kt
+@@ -0,0 +1,57 @@
++package sh.hnet.comfychair.storage
++
++import android.content.Context
++import org.json.JSONArray
++import org.json.JSONObject
++
++/**
++ * The prompts of submitted jobs, newest first, from every generation screen: kept on the device so a prompt can be
++ * used again. A prompt submitted again moves to the top instead of being listed twice.
++ */
++class PromptHistoryStorage(context: Context) {
++    private val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
++
++    /** A submitted prompt, the screen it was submitted from (its owner ID) and when. */
++    data class Entry(val prompt: String, val ownerId: String, val time: Long)
++
++    companion object {
++        const val PREFS_NAME = "PromptHistoryPrefs"
++        private const val KEY_ENTRIES = "entries"
++        const val MAX_ENTRIES = 200
++    }
++
++    fun entries(): List<Entry> {
++        val json = prefs.getString(KEY_ENTRIES, null) ?: return emptyList()
++        return try {
++            val array = JSONArray(json)
++            (0 until array.length()).mapNotNull { i ->
++                val o = array.optJSONObject(i) ?: return@mapNotNull null
++                val prompt = o.optString("prompt")
++                if (prompt.isBlank()) null else Entry(prompt, o.optString("owner"), o.optLong("time"))
++            }
++        } catch (_: Exception) {
++            emptyList()
++        }
++    }
++
++    @Synchronized
++    fun record(prompt: String, ownerId: String) {
++        if (prompt.isBlank()) return
++        val entries = listOf(Entry(prompt, ownerId, System.currentTimeMillis())) +
++            entries().filterNot { it.prompt == prompt }
++        save(entries.take(MAX_ENTRIES))
++    }
++
++    @Synchronized
++    fun remove(prompt: String) = save(entries().filterNot { it.prompt == prompt })
++
++    fun clear() {
++        prefs.edit().remove(KEY_ENTRIES).apply()
++    }
++
++    private fun save(entries: List<Entry>) {
++        val array = JSONArray()
++        entries.forEach { array.put(JSONObject().put("prompt", it.prompt).put("owner", it.ownerId).put("time", it.time)) }
++        prefs.edit().putString(KEY_ENTRIES, array.toString()).apply()
++    }
++}
+diff --git a/app/src/main/java/sh/hnet/comfychair/storage/PromptPresetStorage.kt b/app/src/main/java/sh/hnet/comfychair/storage/PromptPresetStorage.kt
+index 5d8824b..ec63faf 100644
+--- a/app/src/main/java/sh/hnet/comfychair/storage/PromptPresetStorage.kt
++++ b/app/src/main/java/sh/hnet/comfychair/storage/PromptPresetStorage.kt
+@@ -6,6 +6,7 @@ import kotlinx.coroutines.flow.StateFlow
+ import kotlinx.coroutines.flow.MutableStateFlow
+ import android.content.Context
+ import org.json.JSONArray
++import org.json.JSONObject
+ import sh.hnet.comfychair.model.PromptPreset
+ import sh.hnet.comfychair.model.ScreenType
+ 
+@@ -20,6 +21,7 @@ class PromptPresetStorage(context: Context) {
+         const val PREFS_NAME = "PromptPresetPrefs"
+         private const val KEY_PRESETS_JSON = "presets_json"
+         const val MAX_FAVORITES_PER_SCREEN = 8
++        private const val LIBRARY_FORMAT = "comfychair-prompt-library"
+ 
+         private val _changes = MutableStateFlow(0)
+ 
+@@ -161,6 +163,34 @@ class PromptPresetStorage(context: Context) {
+         }
+     }
+ 
++    /** The whole library (every screen's prompts) as a file's text, to move it to another device or keep it. */
++    fun exportJson(): String {
++        val presets = JSONArray()
++        getPresets().forEach { presets.put(it.toJson()) }
++        return JSONObject()
++            .put("format", LIBRARY_FORMAT)
++            .put("version", 1)
++            .put("presets", presets)
++            .toString(2)
++    }
++
++    /**
++     * Prompts from [exportJson]'s text added to the library; one with an ID already there replaces it. Returns how many
++     * were read, or -1 when the text isn't a prompt library.
++     */
++    fun importJson(text: String): Int {
++        val presets = try {
++            JSONObject(text).optJSONArray("presets")
++        } catch (_: Exception) {
++            null
++        } ?: return -1
++        val read = (0 until presets.length()).mapNotNull { i -> presets.optJSONObject(i)?.let { PromptPreset.fromJson(it) } }
++        if (read.isEmpty()) return 0
++        val ids = read.map { it.id }.toSet()
++        savePresets(getPresets().filterNot { it.id in ids } + read)
++        return read.size
++    }
++
+     /**
+      * Count favorites for a screen type.
+      */
+diff --git a/app/src/main/java/sh/hnet/comfychair/ui/components/ServerLogDialog.kt b/app/src/main/java/sh/hnet/comfychair/ui/components/ServerLogDialog.kt
+new file mode 100644
+index 0000000..31c3dcd
+--- /dev/null
++++ b/app/src/main/java/sh/hnet/comfychair/ui/components/ServerLogDialog.kt
+@@ -0,0 +1,250 @@
++package sh.hnet.comfychair.ui.components
++
++import android.content.Intent
++import android.widget.Toast
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.PaddingValues
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.WindowInsets
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.safeDrawing
++import androidx.compose.foundation.layout.windowInsetsPadding
++import androidx.compose.foundation.lazy.LazyColumn
++import androidx.compose.foundation.lazy.itemsIndexed
++import androidx.compose.foundation.lazy.rememberLazyListState
++import androidx.compose.foundation.text.selection.SelectionContainer
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.rounded.Close
++import androidx.compose.material.icons.rounded.Pause
++import androidx.compose.material.icons.rounded.PlayArrow
++import androidx.compose.material.icons.rounded.Search
++import androidx.compose.material.icons.rounded.VerticalAlignBottom
++import androidx.compose.material3.Button
++import androidx.compose.material3.Icon
++import androidx.compose.material3.IconButton
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.OutlinedTextField
++import androidx.compose.material3.SmallFloatingActionButton
++import androidx.compose.material3.Surface
++import androidx.compose.material3.Text
++import androidx.compose.material3.TextButton
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.derivedStateOf
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.rememberCoroutineScope
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.res.stringResource
++import androidx.compose.ui.text.font.FontFamily
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.window.Dialog
++import androidx.compose.ui.window.DialogProperties
++import kotlin.coroutines.resume
++import kotlin.coroutines.suspendCoroutine
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.launch
++import sh.hnet.comfychair.R
++import sh.hnet.comfychair.connection.ConnectionManager
++import sh.hnet.comfychair.ui.components.shared.NoOverscrollContainer
++import sh.hnet.comfychair.util.PrivacyUtils
++
++/** How often the server's log is read while the viewer is open. */
++private const val POLL_MS = 1500L
++
++/**
++ * The ComfyUI server's console log, live: model loading, each sampling step with its progress bar, warnings and errors,
++ * as the server's terminal shows them. Read every 1.5 s while open; it follows new lines until scrolled up. Lines can
++ * be filtered, copied and shared.
++ */
++@Composable
++fun ServerLogDialog(onDismiss: () -> Unit) {
++    val context = LocalContext.current
++    var lines by remember { mutableStateOf<List<String>>(emptyList()) }
++    var error by remember { mutableStateOf<String?>(null) }
++    var loaded by remember { mutableStateOf(false) }
++    var paused by remember { mutableStateOf(false) }
++    var filter by remember { mutableStateOf("") }
++    var showFilter by remember { mutableStateOf(false) }
++    val listState = rememberLazyListState()
++    var isFollowing by remember { mutableStateOf(true) }
++    val scope = rememberCoroutineScope()
++
++    val shown = remember(lines, filter) {
++        if (filter.isBlank()) lines else lines.filter { it.contains(filter, ignoreCase = true) }
++    }
++
++    val isAtBottom by remember {
++        derivedStateOf {
++            val last = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
++            val total = listState.layoutInfo.totalItemsCount
++            total == 0 || last >= total - 2
++        }
++    }
++    LaunchedEffect(isAtBottom) { if (isAtBottom) isFollowing = true }
++    LaunchedEffect(listState.firstVisibleItemIndex) { if (!isAtBottom && shown.isNotEmpty()) isFollowing = false }
++
++    // Read while open and not paused
++    LaunchedEffect(paused) {
++        while (!paused) {
++            val client = ConnectionManager.clientOrNull
++            if (client == null) {
++                error = context.getString(R.string.error_no_connection)
++            } else {
++                val (newLines, newError) = suspendCoroutine<Pair<List<String>?, String?>> { cont ->
++                    client.fetchServerLog { l, e -> cont.resume(l to e) }
++                }
++                if (newLines != null) {
++                    error = null
++                    if (newLines != lines) lines = newLines
++                } else {
++                    error = newError
++                }
++            }
++            loaded = true
++            delay(POLL_MS)
++        }
++    }
++    LaunchedEffect(shown.size) {
++        if (isFollowing && shown.isNotEmpty()) listState.scrollToItem(shown.size - 1)
++    }
++
++    Dialog(
++        onDismissRequest = onDismiss,
++        properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)
++    ) {
++        Surface(color = MaterialTheme.colorScheme.surface, modifier = Modifier.fillMaxSize()) {
++            Column(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)) {
++                Row(
++                    verticalAlignment = Alignment.CenterVertically,
++                    modifier = Modifier.fillMaxWidth().padding(start = 4.dp, end = 4.dp, top = 8.dp, bottom = 8.dp)
++                ) {
++                    IconButton(onClick = onDismiss) {
++                        Icon(Icons.Rounded.Close, contentDescription = stringResource(R.string.content_description_close))
++                    }
++                    Text(
++                        stringResource(R.string.title_server_log),
++                        style = MaterialTheme.typography.titleLarge,
++                        modifier = Modifier.padding(start = 8.dp).weight(1f)
++                    )
++                    IconButton(onClick = { showFilter = !showFilter }) {
++                        Icon(Icons.Rounded.Search, contentDescription = stringResource(R.string.label_server_log_filter))
++                    }
++                    IconButton(onClick = { paused = !paused }) {
++                        Icon(
++                            if (paused) Icons.Rounded.PlayArrow else Icons.Rounded.Pause,
++                            contentDescription = stringResource(if (paused) R.string.button_server_log_resume else R.string.button_server_log_pause)
++                        )
++                    }
++                }
++                if (showFilter) {
++                    OutlinedTextField(
++                        value = filter,
++                        onValueChange = { filter = it },
++                        singleLine = true,
++                        label = { Text(stringResource(R.string.label_server_log_filter)) },
++                        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)
++                    )
++                }
++                error?.let {
++                    Text(
++                        text = stringResource(R.string.error_server_log, it),
++                        style = MaterialTheme.typography.bodySmall,
++                        color = MaterialTheme.colorScheme.error,
++                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)
++                    )
++                }
++
++                Box(Modifier.weight(1f).fillMaxWidth()) {
++                    if (shown.isEmpty()) {
++                        Text(
++                            text = stringResource(if (loaded) R.string.msg_server_log_empty else R.string.msg_server_log_loading),
++                            style = MaterialTheme.typography.bodyLarge,
++                            color = MaterialTheme.colorScheme.onSurfaceVariant,
++                            modifier = Modifier.align(Alignment.Center).padding(24.dp)
++                        )
++                    } else {
++                        NoOverscrollContainer(modifier = Modifier.fillMaxSize()) {
++                            SelectionContainer {
++                                LazyColumn(
++                                    state = listState,
++                                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
++                                    modifier = Modifier.fillMaxSize()
++                                ) {
++                                    itemsIndexed(shown) { _, line -> ServerLogLine(line) }
++                                }
++                            }
++                        }
++                    }
++                    if (!isFollowing && shown.isNotEmpty()) {
++                        SmallFloatingActionButton(
++                            onClick = {
++                                scope.launch {
++                                    isFollowing = true
++                                    listState.scrollToItem(shown.size - 1)
++                                }
++                            },
++                            modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp)
++                        ) {
++                            Icon(Icons.Rounded.VerticalAlignBottom, contentDescription = stringResource(R.string.debug_log_follow))
++                        }
++                    }
++                }
++
++                Row(
++                    verticalAlignment = Alignment.CenterVertically,
++                    horizontalArrangement = Arrangement.spacedBy(8.dp),
++                    modifier = Modifier.padding(16.dp)
++                ) {
++                    TextButton(
++                        onClick = {
++                            PrivacyUtils.copySensitiveText(context, "ComfyUI log", shown.joinToString("\n"))
++                            Toast.makeText(context, R.string.msg_copied_to_clipboard, Toast.LENGTH_SHORT).show()
++                        },
++                        enabled = shown.isNotEmpty()
++                    ) { Text(stringResource(R.string.button_copy)) }
++                    Button(
++                        onClick = {
++                            // The latest lines only: a share carries a limited amount of text
++                            val text = shown.takeLast(2000).joinToString("\n")
++                            val send = Intent(Intent.ACTION_SEND).apply {
++                                type = "text/plain"
++                                putExtra(Intent.EXTRA_TEXT, text)
++                            }
++                            context.startActivity(Intent.createChooser(send, null))
++                        },
++                        enabled = shown.isNotEmpty(),
++                        modifier = Modifier.weight(1f).height(56.dp)
++                    ) { Text(stringResource(R.string.button_share)) }
++                }
++            }
++        }
++    }
++}
++
++/** A line of the log, colored when it reads as an error or a warning. */
++@Composable
++private fun ServerLogLine(line: String) {
++    val lower = line.lowercase()
++    val color = when {
++        "error" in lower || "exception" in lower || "traceback" in lower -> MaterialTheme.colorScheme.error
++        "warn" in lower -> MaterialTheme.colorScheme.tertiary
++        else -> MaterialTheme.colorScheme.onSurfaceVariant
++    }
++    Text(
++        text = line.ifEmpty { " " },
++        style = MaterialTheme.typography.bodySmall,
++        fontFamily = FontFamily.Monospace,
++        color = color,
++        modifier = Modifier.padding(vertical = 1.dp)
++    )
++}
+diff --git a/app/src/main/java/sh/hnet/comfychair/ui/components/config/BottomSheetConfig.kt b/app/src/main/java/sh/hnet/comfychair/ui/components/config/BottomSheetConfig.kt
+index 83096b4..ebdabf6 100644
+--- a/app/src/main/java/sh/hnet/comfychair/ui/components/config/BottomSheetConfig.kt
++++ b/app/src/main/java/sh/hnet/comfychair/ui/components/config/BottomSheetConfig.kt
+@@ -121,7 +121,11 @@ data class NumericField(
+     val value: String,
+     val onValueChange: (String) -> Unit,
+     val error: String? = null,
+-    val isVisible: Boolean = true
++    val isVisible: Boolean = true,
++    /** Shown as a slider over this range (two decimals) instead of a text field; null for a text field */
++    val slider: ClosedFloatingPointRange<Float>? = null,
++    /** On the slider, the value marked as the recommended one */
++    val sliderMark: Float? = null
+ )
+ 
+ /**
 diff --git a/app/src/main/java/sh/hnet/comfychair/ui/components/config/BottomSheetConfigExtensions.kt b/app/src/main/java/sh/hnet/comfychair/ui/components/config/BottomSheetConfigExtensions.kt
-index fa795d3..8343f60 100644
+index fa795d3..47fcc5d 100644
 --- a/app/src/main/java/sh/hnet/comfychair/ui/components/config/BottomSheetConfigExtensions.kt
 +++ b/app/src/main/java/sh/hnet/comfychair/ui/components/config/BottomSheetConfigExtensions.kt
 @@ -9,6 +9,7 @@ import sh.hnet.comfychair.viewmodel.ImageToImageMode
@@ -507,16 +949,492 @@ index fa795d3..8343f60 100644
  import sh.hnet.comfychair.viewmodel.TextToImageUiState
  import sh.hnet.comfychair.viewmodel.TextToVideoUiState
  
-@@ -152,6 +153,9 @@ fun ImageToVideoUiState.toBottomSheetConfig(callbacks: UnifiedCallbacks): Bottom
+@@ -152,6 +153,16 @@ fun ImageToVideoUiState.toBottomSheetConfig(callbacks: UnifiedCallbacks): Bottom
  fun VideoToVideoUiState.toBottomSheetConfig(callbacks: UnifiedCallbacks): BottomSheetConfig =
      toBottomSheetConfig(availableWorkflows, callbacks)
  
++/** Reference to Video (MiniMax H3 only): megapixels on a 0.01-1.00 slider, 0.4 marked as balanced. */
 +fun ReferenceToVideoUiState.toBottomSheetConfig(callbacks: UnifiedCallbacks): BottomSheetConfig =
-+    toBottomSheetConfig(availableWorkflows, callbacks)
++    toBottomSheetConfig(availableWorkflows, callbacks).let { config ->
++        config.copy(
++            parameters = config.parameters.copy(
++                megapixels = config.parameters.megapixels?.copy(slider = 0.01f..1.0f, sliderMark = 0.4f)
++            )
++        )
++    }
 +
  /** The workflow menu of a screen with one kind of workflow: one untitled group. */
  fun singleWorkflowGroup(workflows: List<WorkflowItemBase>, onWorkflowChange: (String) -> Unit): List<WorkflowGroup> =
      listOf(WorkflowGroup(null, workflows, isCurrent = true, icon = WorkflowIcons.default, onSelect = onWorkflowChange))
+diff --git a/app/src/main/java/sh/hnet/comfychair/ui/components/config/ConfigBottomSheetContent.kt b/app/src/main/java/sh/hnet/comfychair/ui/components/config/ConfigBottomSheetContent.kt
+index b28d618..3513596 100644
+--- a/app/src/main/java/sh/hnet/comfychair/ui/components/config/ConfigBottomSheetContent.kt
++++ b/app/src/main/java/sh/hnet/comfychair/ui/components/config/ConfigBottomSheetContent.kt
+@@ -333,10 +333,22 @@ private fun Field(
+     val models = config.models
+     fun number(parameter: NumberParameter, numeric: NumericField?) = @Composable {
+         numeric?.let {
+-            ConstrainedNumberField(
+-                parameter, workflowName, it.value, it.onValueChange, it.error, modifier,
+-                label = fieldLabel(field, parameter.labelRes)
+-            )
++            val range = it.slider
++            if (range != null) {
++                SliderNumberField(
++                    label = fieldLabel(field, parameter.labelRes),
++                    value = it.value,
++                    range = range,
++                    mark = it.sliderMark,
++                    onValueChange = it.onValueChange,
++                    modifier = modifier
++                )
++            } else {
++                ConstrainedNumberField(
++                    parameter, workflowName, it.value, it.onValueChange, it.error, modifier,
++                    label = fieldLabel(field, parameter.labelRes)
++                )
++            }
+         }
+     }
+     fun dropdown(labelRes: Int, dropdown: DropdownField?) = @Composable {
+diff --git a/app/src/main/java/sh/hnet/comfychair/ui/components/config/SliderNumberField.kt b/app/src/main/java/sh/hnet/comfychair/ui/components/config/SliderNumberField.kt
+new file mode 100644
+index 0000000..5d52ab3
+--- /dev/null
++++ b/app/src/main/java/sh/hnet/comfychair/ui/components/config/SliderNumberField.kt
+@@ -0,0 +1,56 @@
++package sh.hnet.comfychair.ui.components.config
++
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.padding
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.Slider
++import androidx.compose.material3.Text
++import androidx.compose.material3.TextButton
++import androidx.compose.runtime.Composable
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.res.stringResource
++import androidx.compose.ui.unit.dp
++import java.util.Locale
++import kotlin.math.roundToInt
++import sh.hnet.comfychair.R
++
++/**
++ * A number chosen on a slider over [range], in steps of 0.01, its value shown beside the label. [mark], when given, is
++ * the recommended value: a button puts the slider back on it.
++ */
++@Composable
++fun SliderNumberField(
++    label: String,
++    value: String,
++    range: ClosedFloatingPointRange<Float>,
++    mark: Float?,
++    onValueChange: (String) -> Unit,
++    modifier: Modifier = Modifier
++) {
++    val current = (value.toFloatOrNull() ?: mark ?: range.start).coerceIn(range.start, range.endInclusive)
++    // One stop per hundredth between the ends
++    val steps = (((range.endInclusive - range.start) * 100).roundToInt() - 1).coerceAtLeast(0)
++    fun format(v: Float) = String.format(Locale.US, "%.2f", v)
++
++    Column(modifier.padding(horizontal = 4.dp)) {
++        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
++            Text(label, style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
++            Text(format(current), style = MaterialTheme.typography.titleMedium)
++        }
++        Slider(
++            value = current,
++            onValueChange = { onValueChange(format((it * 100).roundToInt() / 100f)) },
++            valueRange = range,
++            steps = steps,
++            modifier = Modifier.fillMaxWidth()
++        )
++        if (mark != null) {
++            TextButton(onClick = { onValueChange(format(mark)) }) {
++                Text(stringResource(R.string.label_slider_recommended, format(mark)))
++            }
++        }
++    }
++}
+diff --git a/app/src/main/java/sh/hnet/comfychair/ui/components/generation/GenerationScreenParts.kt b/app/src/main/java/sh/hnet/comfychair/ui/components/generation/GenerationScreenParts.kt
+index 1a762b6..f6137fc 100644
+--- a/app/src/main/java/sh/hnet/comfychair/ui/components/generation/GenerationScreenParts.kt
++++ b/app/src/main/java/sh/hnet/comfychair/ui/components/generation/GenerationScreenParts.kt
+@@ -67,6 +67,7 @@ import androidx.lifecycle.LifecycleEventObserver
+ import androidx.lifecycle.compose.LocalLifecycleOwner
+ import kotlinx.coroutines.launch
+ import sh.hnet.comfychair.R
++import sh.hnet.comfychair.storage.PromptHistoryStorage
+ import sh.hnet.comfychair.WorkflowEditorActivity
+ import sh.hnet.comfychair.WorkflowManager
+ import sh.hnet.comfychair.connection.ConnectionManager
+@@ -381,6 +382,8 @@ fun rememberJobSubmitter(
+                 val description = describe()
+                 generationViewModel.startGeneration(workflowJson, ownerId, contentType, front) { success, promptId, errorMessage ->
+                     if (success && promptId != null && description != null) JobRegistry.describeJob(promptId, description)
++                    // Kept for the prompt history, from any screen
++                    if (success && description != null) PromptHistoryStorage(context).record(description.prompt, ownerId)
+                     if (!success) {
+                         // The server's reasons (e.g. the inputs that failed validation) behind Show
+                         AppErrors.report(
+diff --git a/app/src/main/java/sh/hnet/comfychair/ui/components/generation/PromptEditor.kt b/app/src/main/java/sh/hnet/comfychair/ui/components/generation/PromptEditor.kt
+index aae41ae..7a1106a 100644
+--- a/app/src/main/java/sh/hnet/comfychair/ui/components/generation/PromptEditor.kt
++++ b/app/src/main/java/sh/hnet/comfychair/ui/components/generation/PromptEditor.kt
+@@ -23,6 +23,8 @@ import androidx.compose.material.icons.Icons
+ import androidx.compose.material.icons.automirrored.rounded.Backspace
+ import androidx.compose.material.icons.rounded.AutoAwesome
+ import androidx.compose.material.icons.rounded.BookmarkAdd
++import androidx.compose.material.icons.rounded.Build
++import androidx.compose.material.icons.rounded.History
+ import androidx.compose.material.icons.rounded.Check
+ import androidx.compose.material.icons.rounded.Close
+ import androidx.compose.material3.Button
+@@ -228,6 +230,8 @@ private fun PromptEditor(
+     onDismiss: () -> Unit
+ ) {
+     var tab by rememberSaveable { mutableStateOf(initialTab) }
++    var showHistory by remember { mutableStateOf(false) }
++    var showBuilder by remember { mutableStateOf(false) }
+     val text = if (tab == PromptTab.POSITIVE) positive else negative
+     val onTextChange = if (tab == PromptTab.POSITIVE) onPositiveChange else onNegativeChange
+ 
+@@ -327,6 +331,8 @@ private fun PromptEditor(
+                             { presetViewModel.showSaveDialog(positive) },
+                             enabled = positive.isNotBlank()
+                         )
++                        TooltipIconButton(Icons.Rounded.History, stringResource(R.string.title_prompt_history), { showHistory = true })
++                        TooltipIconButton(Icons.Rounded.Build, stringResource(R.string.title_h3_builder), { showBuilder = true })
+                     }
+                     TooltipIconButton(
+                         Icons.AutoMirrored.Rounded.Backspace,
+@@ -349,4 +355,17 @@ private fun PromptEditor(
+             }
+         }
+     }
++
++    if (showHistory) {
++        PromptHistoryDialog(onUse = onPositiveChange, onDismiss = { showHistory = false })
++    }
++    if (showBuilder) {
++        H3PromptBuilderDialog(
++            prompt = positive,
++            // A prompt already naming videos or audio, or laid out for references, opens on the reference layout
++            referenceMode = positive.contains("subject_definitions") || Regex("<(Video|Audio) \\d+>").containsMatchIn(positive),
++            onApply = onPositiveChange,
++            onDismiss = { showBuilder = false }
++        )
++    }
+ }
+diff --git a/app/src/main/java/sh/hnet/comfychair/ui/components/generation/PromptTools.kt b/app/src/main/java/sh/hnet/comfychair/ui/components/generation/PromptTools.kt
+new file mode 100644
+index 0000000..00dab88
+--- /dev/null
++++ b/app/src/main/java/sh/hnet/comfychair/ui/components/generation/PromptTools.kt
+@@ -0,0 +1,300 @@
++package sh.hnet.comfychair.ui.components.generation
++
++import androidx.compose.foundation.clickable
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.RowScope
++import androidx.compose.foundation.layout.Spacer
++import androidx.compose.foundation.layout.WindowInsets
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.heightIn
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.safeDrawing
++import androidx.compose.foundation.layout.windowInsetsPadding
++import androidx.compose.foundation.lazy.LazyColumn
++import androidx.compose.foundation.lazy.items
++import androidx.compose.foundation.rememberScrollState
++import androidx.compose.foundation.verticalScroll
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.rounded.Close
++import androidx.compose.material.icons.rounded.Delete
++import androidx.compose.material3.Button
++import androidx.compose.material3.ButtonGroupDefaults
++import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
++import androidx.compose.material3.HorizontalDivider
++import androidx.compose.material3.Icon
++import androidx.compose.material3.IconButton
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.OutlinedTextField
++import androidx.compose.material3.Surface
++import androidx.compose.material3.Switch
++import androidx.compose.material3.Text
++import androidx.compose.material3.TextButton
++import androidx.compose.material3.ToggleButton
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateListOf
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.res.stringResource
++import androidx.compose.ui.text.style.TextOverflow
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.window.Dialog
++import androidx.compose.ui.window.DialogProperties
++import java.text.DateFormat
++import java.util.Date
++import sh.hnet.comfychair.R
++import sh.hnet.comfychair.storage.PromptHistoryStorage
++
++/** The screen a history entry was submitted from, by the owner ID of its job. */
++private fun ownerLabel(ownerId: String): Int? = when (ownerId) {
++    "TEXT_TO_IMAGE" -> R.string.nav_text_to_image
++    "IMAGE_TO_IMAGE" -> R.string.nav_image_to_image
++    "TEXT_TO_VIDEO" -> R.string.nav_text_to_video
++    "IMAGE_TO_VIDEO" -> R.string.nav_image_to_video
++    "VIDEO_TO_VIDEO" -> R.string.nav_video_to_video
++    "REFERENCE_TO_VIDEO" -> R.string.nav_reference_to_video
++    else -> null
++}
++
++/** A full-screen dialog with a title bar (close), the content, and an optional bottom row. */
++@Composable
++private fun ToolDialog(
++    title: String,
++    onDismiss: () -> Unit,
++    actions: (@Composable RowScope.() -> Unit)? = null,
++    content: @Composable () -> Unit
++) {
++    Dialog(
++        onDismissRequest = onDismiss,
++        properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)
++    ) {
++        Surface(color = MaterialTheme.colorScheme.surface, modifier = Modifier.fillMaxSize()) {
++            Column(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)) {
++                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(4.dp)) {
++                    IconButton(onClick = onDismiss) {
++                        Icon(Icons.Rounded.Close, contentDescription = stringResource(R.string.content_description_close))
++                    }
++                    Text(title, style = MaterialTheme.typography.titleLarge, modifier = Modifier.padding(start = 8.dp))
++                }
++                Column(Modifier.weight(1f).fillMaxWidth()) { content() }
++                if (actions != null) {
++                    Row(
++                        verticalAlignment = Alignment.CenterVertically,
++                        horizontalArrangement = Arrangement.spacedBy(8.dp),
++                        modifier = Modifier.fillMaxWidth().padding(16.dp),
++                        content = actions
++                    )
++                }
++            }
++        }
++    }
++}
++
++/**
++ * The prompts of submitted jobs, newest first, from every screen: searched, tapped to use one, or removed.
++ */
++@Composable
++fun PromptHistoryDialog(onUse: (String) -> Unit, onDismiss: () -> Unit) {
++    val context = LocalContext.current
++    val storage = remember { PromptHistoryStorage(context) }
++    val entries = remember { mutableStateListOf<PromptHistoryStorage.Entry>().apply { addAll(storage.entries()) } }
++    var query by remember { mutableStateOf("") }
++    val shown = entries.filter { query.isBlank() || it.prompt.contains(query, ignoreCase = true) }
++    val dateFormat = remember { DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT) }
++
++    ToolDialog(
++        title = stringResource(R.string.title_prompt_history),
++        onDismiss = onDismiss,
++        actions = {
++            TextButton(
++                onClick = {
++                    storage.clear()
++                    entries.clear()
++                },
++                enabled = entries.isNotEmpty()
++            ) { Text(stringResource(R.string.button_prompt_history_clear)) }
++        }
++    ) {
++        OutlinedTextField(
++            value = query,
++            onValueChange = { query = it },
++            singleLine = true,
++            label = { Text(stringResource(R.string.label_server_log_filter)) },
++            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)
++        )
++        if (shown.isEmpty()) {
++            Text(
++                stringResource(R.string.msg_prompt_history_empty),
++                style = MaterialTheme.typography.bodyLarge,
++                color = MaterialTheme.colorScheme.onSurfaceVariant,
++                modifier = Modifier.padding(24.dp)
++            )
++        } else {
++            LazyColumn(Modifier.fillMaxSize()) {
++                items(shown, key = { it.prompt }) { entry ->
++                    Row(
++                        verticalAlignment = Alignment.CenterVertically,
++                        modifier = Modifier
++                            .fillMaxWidth()
++                            .clickable {
++                                onUse(entry.prompt)
++                                onDismiss()
++                            }
++                            .padding(start = 16.dp, top = 8.dp, bottom = 8.dp)
++                    ) {
++                        Column(Modifier.weight(1f)) {
++                            Text(entry.prompt, style = MaterialTheme.typography.bodyMedium, maxLines = 3, overflow = TextOverflow.Ellipsis)
++                            val screen = ownerLabel(entry.ownerId)?.let { stringResource(it) }
++                            Text(
++                                listOfNotNull(screen, dateFormat.format(Date(entry.time))).joinToString(" · "),
++                                style = MaterialTheme.typography.labelSmall,
++                                color = MaterialTheme.colorScheme.onSurfaceVariant
++                            )
++                        }
++                        IconButton(onClick = {
++                            storage.remove(entry.prompt)
++                            entries.removeAll { it.prompt == entry.prompt }
++                        }) {
++                            Icon(Icons.Rounded.Delete, contentDescription = stringResource(R.string.button_prompt_history_remove))
++                        }
++                    }
++                    HorizontalDivider()
++                }
++            }
++        }
++    }
++}
++
++/** A section of a MiniMax H3 prompt: its heading in the prompt and its label in the builder. */
++private class H3Section(val heading: String, val labelRes: Int, val hintRes: Int, val minLines: Int = 2)
++
++/** REF2VA (reference to video): the six sections, each heading on its own line, as MiniMax H3 reads them. */
++private val REF_SECTIONS = listOf(
++    H3Section("subject_definitions", R.string.label_h3_subjects, R.string.hint_h3_subjects),
++    H3Section("summary", R.string.label_h3_summary, R.string.hint_h3_summary),
++    H3Section("retention_analysis", R.string.label_h3_retention, R.string.hint_h3_retention),
++    H3Section("detailed_description", R.string.label_h3_detail, R.string.hint_h3_detail, minLines = 5),
++    H3Section("overall_soundscape", R.string.label_h3_soundscape, R.string.hint_h3_soundscape),
++    H3Section("non_diegetic_music", R.string.label_h3_music, R.string.hint_h3_music)
++)
++
++/** Text, image or first/last frame to video: three sections, each heading followed by its text on the same line. */
++private val BASE_SECTIONS = listOf(
++    H3Section("integrated_multimodal_description", R.string.label_h3_description, R.string.hint_h3_description, minLines = 5),
++    H3Section("overall_soundscape", R.string.label_h3_soundscape, R.string.hint_h3_soundscape),
++    H3Section("non_diegetic_music", R.string.label_h3_music, R.string.hint_h3_music)
++)
++
++/** The first frame line of image to video: <Picture 1> (the source image) at the start of the video. */
++private const val FIRST_FRAME_LINE =
++    "For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced."
++
++/**
++ * The sections of [prompt] when it's laid out as an H3 prompt ("heading:" then its text), by heading; empty when it
++ * isn't, so the builder starts from scratch.
++ */
++private fun parseSections(prompt: String, sections: List<H3Section>): Map<String, String> {
++    val headings = sections.map { it.heading }
++    val pattern = Regex("(?m)^(${headings.joinToString("|")}):[ \\t]*")
++    val matches = pattern.findAll(prompt).toList()
++    return matches.mapIndexed { i, match ->
++        val end = if (i + 1 < matches.size) matches[i + 1].range.first else prompt.length
++        match.groupValues[1] to prompt.substring(match.range.last + 1, end).trim()
++    }.toMap()
++}
++
++/** The prompt from the builder's fields, in MiniMax H3's layout; empty music is "N/A". */
++private fun buildH3Prompt(reference: Boolean, values: Map<String, String>, firstFrame: Boolean): String {
++    fun value(heading: String) = values[heading].orEmpty().trim().let {
++        if (it.isEmpty() && heading == "non_diegetic_music") "N/A" else it
++    }
++    return if (reference) {
++        REF_SECTIONS.joinToString("\n\n") { "${it.heading}:\n${value(it.heading)}" }
++    } else {
++        val body = BASE_SECTIONS.joinToString("\n\n") { "${it.heading}: ${value(it.heading)}" }
++        if (firstFrame) "$FIRST_FRAME_LINE\n\n$body" else body
++    }
++}
++
++/**
++ * A form for MiniMax H3's structured prompt: Reference to Video's six sections, or the three of text and image to
++ * video, put together in the layout the model was trained on. Opens on [prompt]'s sections when it's laid out that way.
++ *
++ * @param referenceMode Starts on the reference layout (Reference to Video), else the base one
++ */
++@OptIn(ExperimentalMaterial3ExpressiveApi::class)
++@Composable
++fun H3PromptBuilderDialog(prompt: String, referenceMode: Boolean, onApply: (String) -> Unit, onDismiss: () -> Unit) {
++    var reference by remember { mutableStateOf(referenceMode) }
++    var firstFrame by remember { mutableStateOf(prompt.startsWith(FIRST_FRAME_LINE)) }
++    val values = remember {
++        mutableStateOf(parseSections(prompt, REF_SECTIONS) + parseSections(prompt, BASE_SECTIONS))
++    }
++    val sections = if (reference) REF_SECTIONS else BASE_SECTIONS
++
++    ToolDialog(
++        title = stringResource(R.string.title_h3_builder),
++        onDismiss = onDismiss,
++        actions = {
++            Spacer(Modifier.weight(1f))
++            Button(
++                onClick = {
++                    onApply(buildH3Prompt(reference, values.value, firstFrame))
++                    onDismiss()
++                },
++                modifier = Modifier.height(48.dp)
++            ) { Text(stringResource(R.string.button_h3_builder_apply)) }
++        }
++    ) {
++        Column(
++            Modifier
++                .fillMaxSize()
++                .verticalScroll(rememberScrollState())
++                .padding(horizontal = 16.dp)
++        ) {
++            Row(horizontalArrangement = Arrangement.spacedBy(ButtonGroupDefaults.ConnectedSpaceBetween)) {
++                ToggleButton(
++                    checked = reference,
++                    onCheckedChange = { if (it) reference = true },
++                    shapes = ButtonGroupDefaults.connectedLeadingButtonShapes()
++                ) { Text(stringResource(R.string.label_h3_mode_reference)) }
++                ToggleButton(
++                    checked = !reference,
++                    onCheckedChange = { if (it) reference = false },
++                    shapes = ButtonGroupDefaults.connectedTrailingButtonShapes()
++                ) { Text(stringResource(R.string.label_h3_mode_base)) }
++            }
++            Text(
++                stringResource(if (reference) R.string.desc_h3_mode_reference else R.string.desc_h3_mode_base),
++                style = MaterialTheme.typography.bodySmall,
++                color = MaterialTheme.colorScheme.onSurfaceVariant,
++                modifier = Modifier.padding(vertical = 8.dp)
++            )
++            if (!reference) {
++                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
++                    Text(stringResource(R.string.label_h3_first_frame), modifier = Modifier.weight(1f))
++                    Switch(checked = firstFrame, onCheckedChange = { firstFrame = it })
++                }
++            }
++            sections.forEach { section ->
++                OutlinedTextField(
++                    value = values.value[section.heading].orEmpty(),
++                    onValueChange = { text -> values.value = values.value + (section.heading to text) },
++                    label = { Text(stringResource(section.labelRes)) },
++                    placeholder = { Text(stringResource(section.hintRes)) },
++                    minLines = section.minLines,
++                    modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp).padding(vertical = 4.dp)
++                )
++            }
++            Spacer(Modifier.height(16.dp))
++        }
++    }
++}
 diff --git a/app/src/main/java/sh/hnet/comfychair/ui/components/generation/QueueSheet.kt b/app/src/main/java/sh/hnet/comfychair/ui/components/generation/QueueSheet.kt
 index 5e2f09a..83a426e 100644
 --- a/app/src/main/java/sh/hnet/comfychair/ui/components/generation/QueueSheet.kt
@@ -1088,6 +2006,55 @@ index 0000000..e0f61e3
 +}
 +
 +private const val VIDEO_ORIGIN = "r2v_video"
+diff --git a/app/src/main/java/sh/hnet/comfychair/ui/screens/SettingsRootScreen.kt b/app/src/main/java/sh/hnet/comfychair/ui/screens/SettingsRootScreen.kt
+index fe209bb..76faff7 100644
+--- a/app/src/main/java/sh/hnet/comfychair/ui/screens/SettingsRootScreen.kt
++++ b/app/src/main/java/sh/hnet/comfychair/ui/screens/SettingsRootScreen.kt
+@@ -11,6 +11,7 @@ import androidx.compose.material.icons.rounded.AccountTree
+ import androidx.compose.material.icons.rounded.AutoAwesome
+ import androidx.compose.material.icons.rounded.BugReport
+ import androidx.compose.material.icons.rounded.DeleteSweep
++import androidx.compose.material.icons.rounded.Terminal
+ import androidx.compose.material.icons.rounded.Info
+ import androidx.compose.material.icons.rounded.Polyline
+ import androidx.compose.material.icons.rounded.RestartAlt
+@@ -23,6 +24,9 @@ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.collectAsState
+ import androidx.compose.runtime.getValue
+ import androidx.compose.runtime.remember
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.setValue
++import sh.hnet.comfychair.ui.components.ServerLogDialog
+ import androidx.compose.ui.platform.LocalContext
+ import androidx.compose.ui.res.stringResource
+ import sh.hnet.comfychair.R
+@@ -54,6 +58,7 @@ fun SettingsRootScreen(viewModel: SettingsViewModel, onOpenPage: (SettingsRoute)
+     val debugLogging by viewModel.isDebugLoggingEnabled.collectAsState()
+     val routerId by viewModel.edgeRouterId.collectAsState()
+     val languageTag = remember { currentLanguageTag(context) }
++    var showServerLog by remember { mutableStateOf(false) }
+ 
+     // Settings tapped again on this list: back to its top
+     val reselects = LocalTabReselects.current
+@@ -128,6 +133,12 @@ fun SettingsRootScreen(viewModel: SettingsViewModel, onOpenPage: (SettingsRoute)
+                     onOpenPage(SettingsRoute.Cache)
+                 }
+             }
++            row { shapes ->
++                SettingsNavigationRow(
++                    shapes, Icons.Rounded.Terminal, stringResource(R.string.title_server_log),
++                    supporting = stringResource(R.string.desc_server_log)
++                ) { showServerLog = true }
++            }
+             row { shapes ->
+                 SettingsNavigationRow(
+                     shapes, Icons.Rounded.BugReport, stringResource(R.string.title_settings_debug_log),
+@@ -148,4 +159,5 @@ fun SettingsRootScreen(viewModel: SettingsViewModel, onOpenPage: (SettingsRoute)
+             }
+         }
+     }
++    if (showServerLog) ServerLogDialog(onDismiss = { showServerLog = false })
+ }
 diff --git a/app/src/main/java/sh/hnet/comfychair/ui/screens/WorkflowsSettingsScreen.kt b/app/src/main/java/sh/hnet/comfychair/ui/screens/WorkflowsSettingsScreen.kt
 index 8e1caf8..8e5a6c8 100644
 --- a/app/src/main/java/sh/hnet/comfychair/ui/screens/WorkflowsSettingsScreen.kt
@@ -1147,6 +2114,79 @@ index 8e1caf8..8e5a6c8 100644
          ).flatten()
              .firstOrNull { it.id == workflowId }
      }
+diff --git a/app/src/main/java/sh/hnet/comfychair/ui/screens/settings/DataSettingsPages.kt b/app/src/main/java/sh/hnet/comfychair/ui/screens/settings/DataSettingsPages.kt
+index 341f542..8dff7ad 100644
+--- a/app/src/main/java/sh/hnet/comfychair/ui/screens/settings/DataSettingsPages.kt
++++ b/app/src/main/java/sh/hnet/comfychair/ui/screens/settings/DataSettingsPages.kt
+@@ -9,6 +9,8 @@ import androidx.activity.result.contract.ActivityResultContracts
+ import androidx.compose.material.icons.Icons
+ import androidx.compose.material.icons.rounded.BugReport
+ import androidx.compose.material.icons.rounded.DeleteSweep
++import androidx.compose.material.icons.rounded.FileDownload
++import androidx.compose.material.icons.rounded.FileUpload
+ import androidx.compose.material.icons.rounded.RestartAlt
+ import androidx.compose.material.icons.rounded.Restore
+ import androidx.compose.material.icons.rounded.SaveAlt
+@@ -25,6 +27,7 @@ import java.text.SimpleDateFormat
+ import java.util.Date
+ import java.util.Locale
+ import sh.hnet.comfychair.R
++import sh.hnet.comfychair.storage.PromptPresetStorage
+ import sh.hnet.comfychair.ui.components.LogViewerDialog
+ import sh.hnet.comfychair.ui.components.settings.ConfirmDestructiveDialog
+ import sh.hnet.comfychair.ui.components.settings.SettingsActionRow
+@@ -49,6 +52,26 @@ fun BackupSettingsPage(viewModel: SettingsViewModel, onNavigateBack: () -> Unit)
+     val restoreLauncher = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+         uri?.let { viewModel.startRestore(it) }
+     }
++    // The prompt library alone, as its own file
++    val exportPromptsLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { uri ->
++        uri ?: return@rememberLauncherForActivityResult
++        val ok = runCatching {
++            context.contentResolver.openOutputStream(uri)?.use {
++                it.write(PromptPresetStorage(context).exportJson().toByteArray(Charsets.UTF_8))
++            } != null
++        }.getOrDefault(false)
++        Toast.makeText(context, if (ok) R.string.msg_prompt_library_exported else R.string.error_prompt_library_file, Toast.LENGTH_SHORT).show()
++    }
++    val importPromptsLauncher = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
++        uri ?: return@rememberLauncherForActivityResult
++        val text = runCatching {
++            context.contentResolver.openInputStream(uri)?.use { it.readBytes().toString(Charsets.UTF_8) }
++        }.getOrNull()
++        val count = text?.let { PromptPresetStorage(context).importJson(it) } ?: -1
++        val message = if (count < 0) context.getString(R.string.error_prompt_library_file)
++            else context.getString(R.string.msg_prompt_library_imported, count)
++        Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
++    }
+ 
+     SettingsPage(stringResource(R.string.title_backup_restore), onNavigateBack) {
+         SettingsDescription(stringResource(R.string.desc_backup_restore))
+@@ -70,6 +93,24 @@ fun BackupSettingsPage(viewModel: SettingsViewModel, onNavigateBack: () -> Unit)
+                 )
+             }
+         }
++        SettingsGroup(stringResource(R.string.title_prompt_library_file)) {
++            row { shapes ->
++                SettingsActionRow(
++                    shapes = shapes,
++                    icon = Icons.Rounded.FileUpload,
++                    title = stringResource(R.string.button_prompt_library_export),
++                    onClick = { exportPromptsLauncher.launch("comfychair_prompts_${timestamp()}.json") }
++                )
++            }
++            row { shapes ->
++                SettingsActionRow(
++                    shapes = shapes,
++                    icon = Icons.Rounded.FileDownload,
++                    title = stringResource(R.string.button_prompt_library_import),
++                    onClick = { importPromptsLauncher.launch("application/json") }
++                )
++            }
++        }
+     }
+ }
+ 
 diff --git a/app/src/main/java/sh/hnet/comfychair/util/ValidationUtils.kt b/app/src/main/java/sh/hnet/comfychair/util/ValidationUtils.kt
 index f3c11fc..153f57b 100644
 --- a/app/src/main/java/sh/hnet/comfychair/util/ValidationUtils.kt
@@ -2403,10 +3443,10 @@ index 0000000..12197ae
 +}
 \ No newline at end of file
 diff --git a/app/src/main/res/values-de/strings.xml b/app/src/main/res/values-de/strings.xml
-index c56bada..3e4a0c0 100644
+index c56bada..681f620 100644
 --- a/app/src/main/res/values-de/strings.xml
 +++ b/app/src/main/res/values-de/strings.xml
-@@ -1161,4 +1161,25 @@
+@@ -1161,4 +1161,67 @@
      <string name="sg_remove_output">Ausgang entfernen</string>
      <string name="sg_connect_hint_inputs">Tippe auf einen hervorgehobenen Ausgang oder eine Hinzufügen-Buchse</string>
      <string name="sg_connect_hint_outputs">Tippe auf einen hervorgehobenen Eingang oder eine Hinzufügen-Buchse</string>
@@ -2431,12 +3471,54 @@ index c56bada..3e4a0c0 100644
 +    <string name="label_reference_video_sound">Ton</string>
 +    <string name="error_r2v_no_reference_node">Dieser Workflow hat keinen MiniMax-H3-Reference-to-Video-Knoten und kann keine Referenzen nutzen</string>
 +    <string name="error_megapixels_range_h3">Muss zwischen 0,01 und 1,00 liegen (0,4 ist ausgewogen)</string>
++
++    <!-- Server log, prompt history, H3 builder, prompt library file -->
++    <string name="title_server_log">ComfyUI-Serverprotokoll</string>
++    <string name="desc_server_log">Live-Konsole: Laden, Schritte, Fehler</string>
++    <string name="label_server_log_filter">Filtern</string>
++    <string name="button_server_log_pause">Pause</string>
++    <string name="button_server_log_resume">Fortsetzen</string>
++    <string name="error_server_log">Serverprotokoll nicht lesbar: %1$s</string>
++    <string name="msg_server_log_empty">Das Serverprotokoll ist leer</string>
++    <string name="msg_server_log_loading">Serverprotokoll wird gelesen…</string>
++    <string name="label_slider_recommended">Ausgewogen: %1$s</string>
++    <string name="title_prompt_history">Prompt-Verlauf</string>
++    <string name="button_prompt_history_clear">Verlauf löschen</string>
++    <string name="button_prompt_history_remove">Aus dem Verlauf entfernen</string>
++    <string name="msg_prompt_history_empty">Prompts, mit denen du generierst, erscheinen hier</string>
++    <string name="title_h3_builder">MiniMax-H3-Prompt-Baukasten</string>
++    <string name="button_h3_builder_apply">Prompt verwenden</string>
++    <string name="label_h3_mode_reference">Referenzen</string>
++    <string name="label_h3_mode_base">Text / Bild</string>
++    <string name="desc_h3_mode_reference">Referenzen zu Video: sechs Abschnitte. Referenzen als &lt;Picture N&gt;, &lt;Video N&gt;, &lt;Audio N&gt; nennen.</string>
++    <string name="desc_h3_mode_base">Text, Bild oder erstes/letztes Bild zu Video: Beschreibung, Ton und Musik.</string>
++    <string name="label_h3_first_frame">Beginnt mit dem Quellbild (&lt;Picture 1&gt;)</string>
++    <string name="label_h3_subjects">Subjekte</string>
++    <string name="hint_h3_subjects">Who or what appears, e.g. &lt;Subject 1&gt;: the man in &lt;Picture 1&gt;</string>
++    <string name="label_h3_summary">Zusammenfassung</string>
++    <string name="hint_h3_summary">The video in one or two sentences</string>
++    <string name="label_h3_retention">Übernahme</string>
++    <string name="hint_h3_retention">What to keep from each reference: fully_preserved, partially_preserved, attribute_transfer, weak_reference; audio: fully_copy, partially_copy, reference</string>
++    <string name="label_h3_detail">Ausführliche Beschreibung</string>
++    <string name="hint_h3_detail">Shots and action in order: [Shot 1] …, [Shot 2] At 00:03.000 …</string>
++    <string name="label_h3_soundscape">Klangkulisse</string>
++    <string name="hint_h3_soundscape">Dialogue, effects, ambience</string>
++    <string name="label_h3_music">Musik</string>
++    <string name="hint_h3_music">Background music; empty means N/A</string>
++    <string name="label_h3_description">Beschreibung</string>
++    <string name="hint_h3_description">[Shot 1] The scene, camera and action; [Shot 2] At 00:04.500 …</string>
++    <string name="title_prompt_library_file">Prompt-Bibliothek</string>
++    <string name="button_prompt_library_export">Prompt-Bibliothek exportieren</string>
++    <string name="button_prompt_library_import">Prompt-Bibliothek importieren</string>
++    <string name="msg_prompt_library_exported">Prompt-Bibliothek exportiert</string>
++    <string name="msg_prompt_library_imported">%1$d Prompts importiert</string>
++    <string name="error_prompt_library_file">Diese Datei ist keine Prompt-Bibliothek</string>
  </resources>
 diff --git a/app/src/main/res/values-es/strings.xml b/app/src/main/res/values-es/strings.xml
-index 8156a16..33cc0f5 100644
+index 8156a16..9f26b25 100644
 --- a/app/src/main/res/values-es/strings.xml
 +++ b/app/src/main/res/values-es/strings.xml
-@@ -1194,4 +1194,25 @@
+@@ -1194,4 +1194,67 @@
      <string name="sg_remove_output">Quitar salida</string>
      <string name="sg_connect_hint_inputs">Toca una salida resaltada o una toma «añadir»</string>
      <string name="sg_connect_hint_outputs">Toca una entrada resaltada o una toma «añadir»</string>
@@ -2461,12 +3543,54 @@ index 8156a16..33cc0f5 100644
 +    <string name="label_reference_video_sound">Sonido</string>
 +    <string name="error_r2v_no_reference_node">Este flujo de trabajo no tiene un nodo MiniMax H3 Reference to Video, así que no puede usar referencias</string>
 +    <string name="error_megapixels_range_h3">Debe estar entre 0,01 y 1,00 (0,4 es equilibrado)</string>
++
++    <!-- Server log, prompt history, H3 builder, prompt library file -->
++    <string name="title_server_log">Registro del servidor ComfyUI</string>
++    <string name="desc_server_log">Consola en vivo: carga, pasos, errores</string>
++    <string name="label_server_log_filter">Filtrar</string>
++    <string name="button_server_log_pause">Pausa</string>
++    <string name="button_server_log_resume">Reanudar</string>
++    <string name="error_server_log">No se puede leer el registro del servidor: %1$s</string>
++    <string name="msg_server_log_empty">El registro del servidor está vacío</string>
++    <string name="msg_server_log_loading">Leyendo el registro del servidor…</string>
++    <string name="label_slider_recommended">Equilibrado: %1$s</string>
++    <string name="title_prompt_history">Historial de prompts</string>
++    <string name="button_prompt_history_clear">Borrar historial</string>
++    <string name="button_prompt_history_remove">Quitar del historial</string>
++    <string name="msg_prompt_history_empty">Aquí aparecen los prompts con los que generas</string>
++    <string name="title_h3_builder">Constructor de prompts MiniMax H3</string>
++    <string name="button_h3_builder_apply">Usar prompt</string>
++    <string name="label_h3_mode_reference">Referencias</string>
++    <string name="label_h3_mode_base">Texto / imagen</string>
++    <string name="desc_h3_mode_reference">Referencias a vídeo: seis secciones. Nombra las referencias &lt;Picture N&gt;, &lt;Video N&gt;, &lt;Audio N&gt;.</string>
++    <string name="desc_h3_mode_base">Texto, imagen o primer/último fotograma a vídeo: descripción, sonido y música.</string>
++    <string name="label_h3_first_frame">Empieza desde la imagen de origen (&lt;Picture 1&gt;)</string>
++    <string name="label_h3_subjects">Sujetos</string>
++    <string name="hint_h3_subjects">Who or what appears, e.g. &lt;Subject 1&gt;: the man in &lt;Picture 1&gt;</string>
++    <string name="label_h3_summary">Resumen</string>
++    <string name="hint_h3_summary">The video in one or two sentences</string>
++    <string name="label_h3_retention">Retención</string>
++    <string name="hint_h3_retention">What to keep from each reference: fully_preserved, partially_preserved, attribute_transfer, weak_reference; audio: fully_copy, partially_copy, reference</string>
++    <string name="label_h3_detail">Descripción detallada</string>
++    <string name="hint_h3_detail">Shots and action in order: [Shot 1] …, [Shot 2] At 00:03.000 …</string>
++    <string name="label_h3_soundscape">Paisaje sonoro</string>
++    <string name="hint_h3_soundscape">Dialogue, effects, ambience</string>
++    <string name="label_h3_music">Música</string>
++    <string name="hint_h3_music">Background music; empty means N/A</string>
++    <string name="label_h3_description">Descripción</string>
++    <string name="hint_h3_description">[Shot 1] The scene, camera and action; [Shot 2] At 00:04.500 …</string>
++    <string name="title_prompt_library_file">Biblioteca de prompts</string>
++    <string name="button_prompt_library_export">Exportar biblioteca de prompts</string>
++    <string name="button_prompt_library_import">Importar biblioteca de prompts</string>
++    <string name="msg_prompt_library_exported">Biblioteca de prompts exportada</string>
++    <string name="msg_prompt_library_imported">%1$d prompts importados</string>
++    <string name="error_prompt_library_file">Ese archivo no es una biblioteca de prompts</string>
  </resources>
 diff --git a/app/src/main/res/values-fr/strings.xml b/app/src/main/res/values-fr/strings.xml
-index 7ba9da1..3dfc64f 100644
+index 7ba9da1..8ecb3f8 100644
 --- a/app/src/main/res/values-fr/strings.xml
 +++ b/app/src/main/res/values-fr/strings.xml
-@@ -1194,4 +1194,25 @@
+@@ -1194,4 +1194,67 @@
      <string name="sg_remove_output">Supprimer la sortie</string>
      <string name="sg_connect_hint_inputs">Touchez une sortie mise en évidence ou une prise « ajouter »</string>
      <string name="sg_connect_hint_outputs">Touchez une entrée mise en évidence ou une prise « ajouter »</string>
@@ -2491,12 +3615,54 @@ index 7ba9da1..3dfc64f 100644
 +    <string name="label_reference_video_sound">Son</string>
 +    <string name="error_r2v_no_reference_node">Ce workflow n\'a pas de nœud MiniMax H3 Reference to Video : il ne peut pas utiliser de références</string>
 +    <string name="error_megapixels_range_h3">Doit être entre 0,01 et 1,00 (0,4 est équilibré)</string>
++
++    <!-- Server log, prompt history, H3 builder, prompt library file -->
++    <string name="title_server_log">Journal du serveur ComfyUI</string>
++    <string name="desc_server_log">Console en direct : chargement, étapes, erreurs</string>
++    <string name="label_server_log_filter">Filtrer</string>
++    <string name="button_server_log_pause">Pause</string>
++    <string name="button_server_log_resume">Reprendre</string>
++    <string name="error_server_log">Impossible de lire le journal du serveur : %1$s</string>
++    <string name="msg_server_log_empty">Le journal du serveur est vide</string>
++    <string name="msg_server_log_loading">Lecture du journal du serveur…</string>
++    <string name="label_slider_recommended">Équilibré : %1$s</string>
++    <string name="title_prompt_history">Historique des prompts</string>
++    <string name="button_prompt_history_clear">Effacer l\'historique</string>
++    <string name="button_prompt_history_remove">Retirer de l\'historique</string>
++    <string name="msg_prompt_history_empty">Les prompts que vous générez apparaissent ici</string>
++    <string name="title_h3_builder">Constructeur de prompt MiniMax H3</string>
++    <string name="button_h3_builder_apply">Utiliser le prompt</string>
++    <string name="label_h3_mode_reference">Références</string>
++    <string name="label_h3_mode_base">Texte / image</string>
++    <string name="desc_h3_mode_reference">Références vers vidéo : six sections. Nommez les références &lt;Picture N&gt;, &lt;Video N&gt;, &lt;Audio N&gt;.</string>
++    <string name="desc_h3_mode_base">Texte, image ou première/dernière image vers vidéo : description, son et musique.</string>
++    <string name="label_h3_first_frame">Part de l\'image source (&lt;Picture 1&gt;)</string>
++    <string name="label_h3_subjects">Sujets</string>
++    <string name="hint_h3_subjects">Qui ou quoi apparaît, p. ex. &lt;Subject 1&gt; : l\'homme dans &lt;Picture 1&gt;</string>
++    <string name="label_h3_summary">Résumé</string>
++    <string name="hint_h3_summary">La vidéo en une ou deux phrases</string>
++    <string name="label_h3_retention">Rétention</string>
++    <string name="hint_h3_retention">Ce qu\'on garde de chaque référence : fully_preserved, partially_preserved, attribute_transfer, weak_reference; audio : fully_copy, partially_copy, reference</string>
++    <string name="label_h3_detail">Description détaillée</string>
++    <string name="hint_h3_detail">Plans et action dans l\'ordre : [Shot 1] …, [Shot 2] At 00:03.000 …</string>
++    <string name="label_h3_soundscape">Ambiance sonore</string>
++    <string name="hint_h3_soundscape">Dialogues, effets, ambiance</string>
++    <string name="label_h3_music">Musique</string>
++    <string name="hint_h3_music">Musique de fond; vide = N/A</string>
++    <string name="label_h3_description">Description</string>
++    <string name="hint_h3_description">[Shot 1] La scène, la caméra et l\'action; [Shot 2] At 00:04.500 …</string>
++    <string name="title_prompt_library_file">Bibliothèque de prompts</string>
++    <string name="button_prompt_library_export">Exporter la bibliothèque de prompts</string>
++    <string name="button_prompt_library_import">Importer une bibliothèque de prompts</string>
++    <string name="msg_prompt_library_exported">Bibliothèque de prompts exportée</string>
++    <string name="msg_prompt_library_imported">%1$d prompts importés</string>
++    <string name="error_prompt_library_file">Ce fichier n\'est pas une bibliothèque de prompts</string>
  </resources>
 diff --git a/app/src/main/res/values-pl/strings.xml b/app/src/main/res/values-pl/strings.xml
-index 007f98f..29b91e0 100644
+index 007f98f..ab6bf95 100644
 --- a/app/src/main/res/values-pl/strings.xml
 +++ b/app/src/main/res/values-pl/strings.xml
-@@ -1225,4 +1225,25 @@
+@@ -1225,4 +1225,67 @@
      <string name="sg_remove_output">Usuń wyjście</string>
      <string name="sg_connect_hint_inputs">Dotknij podświetlonego wyjścia albo gniazda „dodaj”</string>
      <string name="sg_connect_hint_outputs">Dotknij podświetlonego wejścia albo gniazda „dodaj”</string>
@@ -2521,12 +3687,54 @@ index 007f98f..29b91e0 100644
 +    <string name="label_reference_video_sound">Dźwięk</string>
 +    <string name="error_r2v_no_reference_node">Ten workflow nie ma węzła MiniMax H3 Reference to Video, więc nie może użyć referencji</string>
 +    <string name="error_megapixels_range_h3">Musi być od 0,01 do 1,00 (0,4 to wartość zrównoważona)</string>
++
++    <!-- Server log, prompt history, H3 builder, prompt library file -->
++    <string name="title_server_log">Dziennik serwera ComfyUI</string>
++    <string name="desc_server_log">Konsola na żywo: ładowanie, kroki, błędy</string>
++    <string name="label_server_log_filter">Filtruj</string>
++    <string name="button_server_log_pause">Wstrzymaj</string>
++    <string name="button_server_log_resume">Wznów</string>
++    <string name="error_server_log">Nie można odczytać dziennika serwera: %1$s</string>
++    <string name="msg_server_log_empty">Dziennik serwera jest pusty</string>
++    <string name="msg_server_log_loading">Odczytywanie dziennika serwera…</string>
++    <string name="label_slider_recommended">Zrównoważone: %1$s</string>
++    <string name="title_prompt_history">Historia promptów</string>
++    <string name="button_prompt_history_clear">Wyczyść historię</string>
++    <string name="button_prompt_history_remove">Usuń z historii</string>
++    <string name="msg_prompt_history_empty">Tu pojawią się prompty, z którymi generujesz</string>
++    <string name="title_h3_builder">Kreator promptów MiniMax H3</string>
++    <string name="button_h3_builder_apply">Użyj promptu</string>
++    <string name="label_h3_mode_reference">Referencje</string>
++    <string name="label_h3_mode_base">Tekst / obraz</string>
++    <string name="desc_h3_mode_reference">Referencje na wideo: sześć sekcji. Nazywaj referencje &lt;Picture N&gt;, &lt;Video N&gt;, &lt;Audio N&gt;.</string>
++    <string name="desc_h3_mode_base">Tekst, obraz lub pierwsza/ostatnia klatka na wideo: opis, dźwięk i muzyka.</string>
++    <string name="label_h3_first_frame">Zaczyna od obrazu źródłowego (&lt;Picture 1&gt;)</string>
++    <string name="label_h3_subjects">Obiekty</string>
++    <string name="hint_h3_subjects">Who or what appears, e.g. &lt;Subject 1&gt;: the man in &lt;Picture 1&gt;</string>
++    <string name="label_h3_summary">Podsumowanie</string>
++    <string name="hint_h3_summary">The video in one or two sentences</string>
++    <string name="label_h3_retention">Zachowanie</string>
++    <string name="hint_h3_retention">What to keep from each reference: fully_preserved, partially_preserved, attribute_transfer, weak_reference; audio: fully_copy, partially_copy, reference</string>
++    <string name="label_h3_detail">Szczegółowy opis</string>
++    <string name="hint_h3_detail">Shots and action in order: [Shot 1] …, [Shot 2] At 00:03.000 …</string>
++    <string name="label_h3_soundscape">Pejzaż dźwiękowy</string>
++    <string name="hint_h3_soundscape">Dialogue, effects, ambience</string>
++    <string name="label_h3_music">Muzyka</string>
++    <string name="hint_h3_music">Background music; empty means N/A</string>
++    <string name="label_h3_description">Opis</string>
++    <string name="hint_h3_description">[Shot 1] The scene, camera and action; [Shot 2] At 00:04.500 …</string>
++    <string name="title_prompt_library_file">Biblioteka promptów</string>
++    <string name="button_prompt_library_export">Eksportuj bibliotekę promptów</string>
++    <string name="button_prompt_library_import">Importuj bibliotekę promptów</string>
++    <string name="msg_prompt_library_exported">Wyeksportowano bibliotekę promptów</string>
++    <string name="msg_prompt_library_imported">Zaimportowano promptów: %1$d</string>
++    <string name="error_prompt_library_file">Ten plik nie jest biblioteką promptów</string>
  </resources>
 diff --git a/app/src/main/res/values-zh/strings.xml b/app/src/main/res/values-zh/strings.xml
-index 054ce22..5fa8afd 100644
+index 054ce22..c55d61e 100644
 --- a/app/src/main/res/values-zh/strings.xml
 +++ b/app/src/main/res/values-zh/strings.xml
-@@ -1132,4 +1132,25 @@
+@@ -1132,4 +1132,67 @@
      <string name="sg_remove_output">移除输出</string>
      <string name="sg_connect_hint_inputs">点按高亮的输出或“添加”插口</string>
      <string name="sg_connect_hint_outputs">点按高亮的输入或“添加”插口</string>
@@ -2551,12 +3759,54 @@ index 054ce22..5fa8afd 100644
 +    <string name="label_reference_video_sound">声音</string>
 +    <string name="error_r2v_no_reference_node">此工作流没有 MiniMax H3 Reference to Video 节点，无法使用参考</string>
 +    <string name="error_megapixels_range_h3">必须在 0.01–1.00 之间（0.4 为均衡值）</string>
++
++    <!-- Server log, prompt history, H3 builder, prompt library file -->
++    <string name="title_server_log">ComfyUI 服务器日志</string>
++    <string name="desc_server_log">实时控制台：加载、步骤、错误</string>
++    <string name="label_server_log_filter">筛选</string>
++    <string name="button_server_log_pause">暂停</string>
++    <string name="button_server_log_resume">继续</string>
++    <string name="error_server_log">无法读取服务器日志：%1$s</string>
++    <string name="msg_server_log_empty">服务器日志为空</string>
++    <string name="msg_server_log_loading">正在读取服务器日志…</string>
++    <string name="label_slider_recommended">均衡：%1$s</string>
++    <string name="title_prompt_history">提示词历史</string>
++    <string name="button_prompt_history_clear">清除历史</string>
++    <string name="button_prompt_history_remove">从历史中移除</string>
++    <string name="msg_prompt_history_empty">你用来生成的提示词会显示在这里</string>
++    <string name="title_h3_builder">MiniMax H3 提示词构建器</string>
++    <string name="button_h3_builder_apply">使用提示词</string>
++    <string name="label_h3_mode_reference">参考</string>
++    <string name="label_h3_mode_base">文本 / 图片</string>
++    <string name="desc_h3_mode_reference">参考生视频：六个部分。用 &lt;Picture N&gt;、&lt;Video N&gt;、&lt;Audio N&gt; 指代参考。</string>
++    <string name="desc_h3_mode_base">文本、图片或首尾帧生视频：描述、声音和音乐。</string>
++    <string name="label_h3_first_frame">从源图片开始（&lt;Picture 1&gt;）</string>
++    <string name="label_h3_subjects">主体</string>
++    <string name="hint_h3_subjects">Who or what appears, e.g. &lt;Subject 1&gt;: the man in &lt;Picture 1&gt;</string>
++    <string name="label_h3_summary">概要</string>
++    <string name="hint_h3_summary">The video in one or two sentences</string>
++    <string name="label_h3_retention">保留</string>
++    <string name="hint_h3_retention">What to keep from each reference: fully_preserved, partially_preserved, attribute_transfer, weak_reference; audio: fully_copy, partially_copy, reference</string>
++    <string name="label_h3_detail">详细描述</string>
++    <string name="hint_h3_detail">Shots and action in order: [Shot 1] …, [Shot 2] At 00:03.000 …</string>
++    <string name="label_h3_soundscape">声音环境</string>
++    <string name="hint_h3_soundscape">Dialogue, effects, ambience</string>
++    <string name="label_h3_music">音乐</string>
++    <string name="hint_h3_music">Background music; empty means N/A</string>
++    <string name="label_h3_description">描述</string>
++    <string name="hint_h3_description">[Shot 1] The scene, camera and action; [Shot 2] At 00:04.500 …</string>
++    <string name="title_prompt_library_file">提示词库</string>
++    <string name="button_prompt_library_export">导出提示词库</string>
++    <string name="button_prompt_library_import">导入提示词库</string>
++    <string name="msg_prompt_library_exported">提示词库已导出</string>
++    <string name="msg_prompt_library_imported">已导入 %1$d 个提示词</string>
++    <string name="error_prompt_library_file">该文件不是提示词库</string>
  </resources>
 diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
-index c681ba6..10d911b 100644
+index c681ba6..5a2f7fd 100644
 --- a/app/src/main/res/values/strings.xml
 +++ b/app/src/main/res/values/strings.xml
-@@ -1193,4 +1193,25 @@
+@@ -1193,4 +1193,67 @@
      <string name="sg_remove_output">Remove output</string>
      <string name="sg_connect_hint_inputs">Tap a highlighted output or an add socket</string>
      <string name="sg_connect_hint_outputs">Tap a highlighted input or an add socket</string>
@@ -2581,4 +3831,46 @@ index c681ba6..10d911b 100644
 +    <string name="label_reference_video_sound">Sound</string>
 +    <string name="error_r2v_no_reference_node">This workflow has no MiniMax H3 Reference to Video node, so it can\'t use references</string>
 +    <string name="error_megapixels_range_h3">Must be 0.01–1.00 (0.4 is balanced)</string>
++
++    <!-- Server log, prompt history, H3 builder, prompt library file -->
++    <string name="title_server_log">ComfyUI server log</string>
++    <string name="desc_server_log">Live console: loading, steps, errors</string>
++    <string name="label_server_log_filter">Filter</string>
++    <string name="button_server_log_pause">Pause</string>
++    <string name="button_server_log_resume">Resume</string>
++    <string name="error_server_log">Can\'t read the server log: %1$s</string>
++    <string name="msg_server_log_empty">The server log is empty</string>
++    <string name="msg_server_log_loading">Reading the server log…</string>
++    <string name="label_slider_recommended">Balanced: %1$s</string>
++    <string name="title_prompt_history">Prompt history</string>
++    <string name="button_prompt_history_clear">Clear history</string>
++    <string name="button_prompt_history_remove">Remove from history</string>
++    <string name="msg_prompt_history_empty">Prompts you generate with appear here</string>
++    <string name="title_h3_builder">MiniMax H3 prompt builder</string>
++    <string name="button_h3_builder_apply">Use prompt</string>
++    <string name="label_h3_mode_reference">References</string>
++    <string name="label_h3_mode_base">Text / image</string>
++    <string name="desc_h3_mode_reference">Reference to Video: six sections. Name references as &lt;Picture N&gt;, &lt;Video N&gt;, &lt;Audio N&gt;.</string>
++    <string name="desc_h3_mode_base">Text, image or first/last frame to video: description, sound and music.</string>
++    <string name="label_h3_first_frame">Starts from the source image (&lt;Picture 1&gt;)</string>
++    <string name="label_h3_subjects">Subjects</string>
++    <string name="hint_h3_subjects">Who or what appears, e.g. &lt;Subject 1&gt;: the man in &lt;Picture 1&gt;</string>
++    <string name="label_h3_summary">Summary</string>
++    <string name="hint_h3_summary">The video in one or two sentences</string>
++    <string name="label_h3_retention">Retention</string>
++    <string name="hint_h3_retention">What to keep from each reference: fully_preserved, partially_preserved, attribute_transfer, weak_reference; audio: fully_copy, partially_copy, reference</string>
++    <string name="label_h3_detail">Detailed description</string>
++    <string name="hint_h3_detail">Shots and action in order: [Shot 1] …, [Shot 2] At 00:03.000 …</string>
++    <string name="label_h3_soundscape">Soundscape</string>
++    <string name="hint_h3_soundscape">Dialogue, effects, ambience</string>
++    <string name="label_h3_music">Music</string>
++    <string name="hint_h3_music">Background music; empty means N/A</string>
++    <string name="label_h3_description">Description</string>
++    <string name="hint_h3_description">[Shot 1] The scene, camera and action; [Shot 2] At 00:04.500 …</string>
++    <string name="title_prompt_library_file">Prompt library</string>
++    <string name="button_prompt_library_export">Export prompt library</string>
++    <string name="button_prompt_library_import">Import prompt library</string>
++    <string name="msg_prompt_library_exported">Prompt library exported</string>
++    <string name="msg_prompt_library_imported">%1$d prompts imported</string>
++    <string name="error_prompt_library_file">That file isn\'t a prompt library</string>
  </resources>
