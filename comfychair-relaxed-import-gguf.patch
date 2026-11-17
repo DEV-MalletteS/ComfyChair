@@ -44,7 +44,7 @@ index 492de7f..9e11a93 100644
                          mediaViewerViewModel = mediaViewerViewModel,
                          settingsViewModel = settingsViewModel,
 diff --git a/app/src/main/java/sh/hnet/comfychair/WorkflowManager.kt b/app/src/main/java/sh/hnet/comfychair/WorkflowManager.kt
-index 9c60053..b473eea 100644
+index 9c60053..a3c2b88 100644
 --- a/app/src/main/java/sh/hnet/comfychair/WorkflowManager.kt
 +++ b/app/src/main/java/sh/hnet/comfychair/WorkflowManager.kt
 @@ -39,7 +39,8 @@ enum class WorkflowType {
@@ -115,7 +115,7 @@ index 9c60053..b473eea 100644
          json = applyBypassedNodes(json)
  
          // LoRA chains: the main chain after the model loader, the high/low noise chains after a
-@@ -1841,9 +1858,142 @@ object WorkflowManager {
+@@ -1841,9 +1858,143 @@ object WorkflowManager {
          if (params.lownoiseLoraChain.isNotEmpty()) {
              json = injectAdditionalVideoLoras(json, params.lownoiseLoraChain, isHighNoise = false)
          }
@@ -171,7 +171,8 @@ index 9c60053..b473eea 100644
 +
 +    /** The reference groups of MiniMaxH3ReferenceToVideo (ComfyUI core), as an API prompt keys them: "group.slot". */
 +    private val REFERENCE_GROUPS = listOf("ref_images", "ref_videos", "ref_video_audios", "ref_audios")
-+    private val REFERENCE_SLOT_PREFIXES = listOf("ref_image_", "ref_video_", "ref_video_audio_", "ref_audio_")
++    /** A reference slot without its group (a numbered slot only: ref_image_size is a setting, not a slot). */
++    private val REFERENCE_SLOT = Regex("^ref_(image|video|video_audio|audio)_\\d+$")
 +
 +    /** Longest part of a reference video that is read: MiniMax H3 takes 2-15 s of a reference video. */
 +    private const val REFERENCE_VIDEO_SECONDS = 15.0
@@ -241,7 +242,7 @@ index 9c60053..b473eea 100644
 +                val inputs = nodes.optJSONObject(target)?.optJSONObject("inputs") ?: continue
 +                // The workflow's own references give way to the chosen ones
 +                inputs.keys().asSequence()
-+                    .filter { key -> REFERENCE_GROUPS.any { key.startsWith("$it.") } || REFERENCE_SLOT_PREFIXES.any { key.startsWith(it) } }
++                    .filter { key -> REFERENCE_GROUPS.any { key.startsWith("$it.") } || REFERENCE_SLOT.matches(key) }
 +                    .toList()
 +                    .forEach { inputs.remove(it) }
 +                wiring.forEach { (key, source) -> inputs.put(key, source) }
@@ -1146,6 +1147,26 @@ index 8e1caf8..8e5a6c8 100644
          ).flatten()
              .firstOrNull { it.id == workflowId }
      }
+diff --git a/app/src/main/java/sh/hnet/comfychair/util/ValidationUtils.kt b/app/src/main/java/sh/hnet/comfychair/util/ValidationUtils.kt
+index f3c11fc..153f57b 100644
+--- a/app/src/main/java/sh/hnet/comfychair/util/ValidationUtils.kt
++++ b/app/src/main/java/sh/hnet/comfychair/util/ValidationUtils.kt
+@@ -84,12 +84,13 @@ object ValidationUtils {
+         value: String,
+         context: Context? = null,
+         min: Float = 0.1f,
+-        max: Float = 8.3f
++        max: Float = 8.3f,
++        errorRes: Int = R.string.error_megapixels_range
+     ): String? {
+         val floatValue = value.toFloatOrNull()
+             ?: return context?.getString(R.string.error_invalid_number) ?: "Invalid number"
+         return if (floatValue !in min..max) {
+-            context?.getString(R.string.error_megapixels_range) ?: "Must be $min-$max"
++            context?.getString(errorRes) ?: "Must be $min-$max"
+         } else null
+     }
+ 
 diff --git a/app/src/main/java/sh/hnet/comfychair/util/VideoUtils.kt b/app/src/main/java/sh/hnet/comfychair/util/VideoUtils.kt
 index 9e54da8..560d8d6 100644
 --- a/app/src/main/java/sh/hnet/comfychair/util/VideoUtils.kt
@@ -1265,10 +1286,10 @@ index 5e140e2..9125d44 100644
                          return
 diff --git a/app/src/main/java/sh/hnet/comfychair/viewmodel/ReferenceToVideoViewModel.kt b/app/src/main/java/sh/hnet/comfychair/viewmodel/ReferenceToVideoViewModel.kt
 new file mode 100644
-index 0000000..bd9d1ff
+index 0000000..243fb0a
 --- /dev/null
 +++ b/app/src/main/java/sh/hnet/comfychair/viewmodel/ReferenceToVideoViewModel.kt
-@@ -0,0 +1,373 @@
+@@ -0,0 +1,379 @@
 +package sh.hnet.comfychair.viewmodel
 +
 +import android.content.Context
@@ -1295,6 +1316,7 @@ index 0000000..bd9d1ff
 +import sh.hnet.comfychair.ui.components.config.CommonGenerationState
 +import sh.hnet.comfychair.util.DebugLogger
 +import sh.hnet.comfychair.util.SeasonalPrompts
++import sh.hnet.comfychair.util.ValidationUtils
 +import sh.hnet.comfychair.util.VideoFrames
 +import sh.hnet.comfychair.util.VideoUtils
 +import sh.hnet.comfychair.viewmodel.base.BaseVideoGenerationViewModel
@@ -1406,6 +1428,11 @@ index 0000000..bd9d1ff
 +    override fun ReferenceToVideoUiState.withVideo(video: VideoResult) = copy(video = video)
 +    override fun ReferenceToVideoUiState.workflows() = availableWorkflows
 +    override fun ReferenceToVideoUiState.withWorkflows(workflows: List<WorkflowItem>) = copy(availableWorkflows = workflows)
++
++    /** MiniMax H3's range: up to ~1 megapixel (its 768p native canvas); 0.4 is the balanced default. */
++    override fun validateMegapixels(megapixels: String): String? =
++        ValidationUtils.validateMegapixels(megapixels, applicationContext, min = 0.01f, max = 1.0f,
++            errorRes = R.string.error_megapixels_range_h3)
 +
 +    override fun onInitialize() {
 +        super.onInitialize()
@@ -1766,6 +1793,24 @@ index bdb7086..7d6e1ce 100644
                  }
  
                  // Validate required fields for type
+diff --git a/app/src/main/java/sh/hnet/comfychair/viewmodel/base/BaseGenerationViewModel.kt b/app/src/main/java/sh/hnet/comfychair/viewmodel/base/BaseGenerationViewModel.kt
+index fa776ba..8dc0a02 100644
+--- a/app/src/main/java/sh/hnet/comfychair/viewmodel/base/BaseGenerationViewModel.kt
++++ b/app/src/main/java/sh/hnet/comfychair/viewmodel/base/BaseGenerationViewModel.kt
+@@ -313,8 +313,12 @@ abstract class BaseGenerationViewModel<UiState> : ViewModel() {
+         updateParams(save = error == null) { it.copy(height = height, heightError = error) }
+     }
+ 
++    /** Megapixels rule of the screen. */
++    protected open fun validateMegapixels(megapixels: String): String? =
++        ValidationUtils.validateMegapixels(megapixels, applicationContext)
++
+     fun onMegapixelsChange(megapixels: String) {
+-        val error = ValidationUtils.validateMegapixels(megapixels, applicationContext)
++        val error = validateMegapixels(megapixels)
+         updateParams(save = error == null) { it.copy(megapixels = megapixels, megapixelsError = error) }
+     }
+ 
 diff --git a/app/src/main/java/sh/hnet/comfychair/workflow/TemplateKeyRegistry.kt b/app/src/main/java/sh/hnet/comfychair/workflow/TemplateKeyRegistry.kt
 index 0ea0ad1..a40c4b3 100644
 --- a/app/src/main/java/sh/hnet/comfychair/workflow/TemplateKeyRegistry.kt
@@ -1793,10 +1838,10 @@ index 0ea0ad1..a40c4b3 100644
      /**
 diff --git a/app/src/main/res/raw/r2v_minimax_h3.json b/app/src/main/res/raw/r2v_minimax_h3.json
 new file mode 100644
-index 0000000..4e66f42
+index 0000000..12197ae
 --- /dev/null
 +++ b/app/src/main/res/raw/r2v_minimax_h3.json
-@@ -0,0 +1,252 @@
+@@ -0,0 +1,559 @@
 +{
 +  "name": "MiniMax H3",
 +  "description": "Workflow for MiniMax H3 reference to video (images, videos and audio as references) with native stereo sound",
@@ -1806,7 +1851,11 @@ index 0000000..4e66f42
 +    "scheduler": "simple",
 +    "width": 480,
 +    "height": 864,
-+    "length": 124
++    "length": 124,
++    "frame_rate": 48,
++    "upscale_method": "lanczos",
++    "scale_by": 0.5,
++    "megapixels": 0.4
 +  },
 +  "groups": [
 +    {
@@ -1825,7 +1874,30 @@ index 0000000..4e66f42
 +      "title": "References",
 +      "member_nodes": [
 +        "7",
++        "49",
++        "50",
++        "51",
++        "52",
++        "53",
 +        "note:2"
++      ]
++    },
++    {
++      "id": 9,
++      "title": "Post-processing",
++      "member_nodes": [
++        "40",
++        "41",
++        "42",
++        "43",
++        "44",
++        "45",
++        "46",
++        "47",
++        "29",
++        "30",
++        "48",
++        "note:9"
 +      ]
 +    }
 +  ],
@@ -1838,7 +1910,12 @@ index 0000000..4e66f42
 +    {
 +      "id": 2,
 +      "title": "References",
-+      "content": "### How It Works\n\nThe references chosen on the screen are wired into **Reference to Video** when generating: up to **9 images**, **3 videos** (their first 15 seconds, with their sound if you keep it) and **3 audio clips**.\n\n- Each reference has a tag: **<Picture N>**, **<Video N>**, **<Audio N>**. Tap a reference to put its tag in the prompt; a reference the prompt doesn't name is ignored.\n- A video's sound is numbered before the standalone audio clips.\n- **Size:** 480 x 864 for speed, up to 768 x 1344 (multiples of 32)\n- **Length:** 124 frames (~5 s at 24 fps); 5 + 17n\n\n---\n\n*Audio alone isn't enough: add at least one image or video. MiniMax H3 uses no negative prompt.*"
++      "content": "### How It Works\n\nThe references chosen on the screen are wired into **Reference to Video** when generating: up to **9 images**, **3 videos** (their first 15 seconds, with their sound if you keep it) and **3 audio clips**.\n\n- Each reference has a tag: **<Picture N>**, **<Video N>**, **<Audio N>**. Tap a reference to put its tag in the prompt; a reference the prompt doesn't name is ignored.\n- A video's sound is numbered before the standalone audio clips.\n- **Megapixels:** 0.01–1.00; **0.4** is balanced, ~1.0 is the 768p native canvas\n- **Aspect width / height:** only the shape (480 x 864 = 9:16 portrait, 864 x 480 = landscape); megapixels sets the size, in multiples of 32\n- **Length:** 124 frames (~5 s at 24 fps); 5 + 17n\n\n---\n\n*Audio alone isn't enough: add at least one image or video. MiniMax H3 uses no negative prompt.*"
++    },
++    {
++      "id": 9,
++      "title": "Post-processing",
++      "content": "### Upscale and Frame Rate\n\n- **Frame rate:** MiniMax H3 makes 24 fps. **48** doubles it with frame interpolation (RIFE or FILM from *models/frame_interpolation*), 72 triples it; **24** turns interpolation off. Other values snap to a multiple of 24, so the sound stays in sync.\n- **Upscale:** off by default. On, each frame goes through the **Upscale model** (e.g. 4x-UltraSharp, from *models/upscale_models*), then **Scale after upscale** (0.5 after a 4x model = 2x overall).\n\n---\n\n*Upscaling runs before interpolation. A 4x model on every frame needs a lot of memory: lower the megapixels or the length if it runs out.*"
 +    }
 +  ],
 +  "nodes": {
@@ -1858,8 +1935,14 @@ index 0000000..4e66f42
 +          0
 +        ],
 +        "prompt": "{{positive_prompt}}",
-+        "width": "{{width}}",
-+        "height": "{{height}}",
++        "width": [
++          "52",
++          1
++        ],
++        "height": [
++          "53",
++          1
++        ],
 +        "length": "{{length}}",
 +        "ref_image_size": "match"
 +      },
@@ -2019,14 +2102,17 @@ index 0000000..4e66f42
 +      "class_type": "CreateVideo",
 +      "inputs": {
 +        "images": [
-+          "25",
++          "48",
 +          0
 +        ],
 +        "audio": [
 +          "26",
 +          0
 +        ],
-+        "fps": 24
++        "fps": [
++          "47",
++          0
++        ]
 +      },
 +      "_meta": {
 +        "title": "Create Video"
@@ -2046,15 +2132,281 @@ index 0000000..4e66f42
 +      "_meta": {
 +        "title": "Save Video"
 +      }
++    },
++    "29": {
++      "class_type": "FrameInterpolationModelLoader",
++      "inputs": {
++        "model_name": "{{field_033cd2fd7b37ad429ee2b2bddbe25170}}"
++      },
++      "_meta": {
++        "title": "Load Frame Interpolation Model"
++      }
++    },
++    "30": {
++      "class_type": "FrameInterpolate",
++      "inputs": {
++        "interp_model": [
++          "29",
++          0
++        ],
++        "images": [
++          "43",
++          0
++        ],
++        "multiplier": [
++          "45",
++          1
++        ]
++      },
++      "_meta": {
++        "title": "Frame Interpolation"
++      }
++    },
++    "40": {
++      "class_type": "UpscaleModelLoader",
++      "inputs": {
++        "model_name": "{{field_beda1d82efae903f710709cbdb380c33}}"
++      },
++      "_meta": {
++        "title": "Load Upscale Model"
++      }
++    },
++    "41": {
++      "class_type": "ImageUpscaleWithModel",
++      "inputs": {
++        "upscale_model": [
++          "40",
++          0
++        ],
++        "image": [
++          "25",
++          0
++        ]
++      },
++      "_meta": {
++        "title": "Upscale with Model"
++      }
++    },
++    "42": {
++      "class_type": "ImageScaleBy",
++      "inputs": {
++        "image": [
++          "41",
++          0
++        ],
++        "upscale_method": "{{upscale_method}}",
++        "scale_by": "{{scale_by}}"
++      },
++      "_meta": {
++        "title": "Scale After Upscale"
++      }
++    },
++    "43": {
++      "class_type": "ComfySwitchNode",
++      "inputs": {
++        "switch": "{{field_8d2cb79ae7db49f0dbeef73afe244daf}}",
++        "on_false": [
++          "25",
++          0
++        ],
++        "on_true": [
++          "42",
++          0
++        ]
++      },
++      "_meta": {
++        "title": "Upscale On/Off"
++      }
++    },
++    "44": {
++      "class_type": "PrimitiveInt",
++      "inputs": {
++        "value": "{{frame_rate}}"
++      },
++      "_meta": {
++        "title": "Output Frame Rate"
++      }
++    },
++    "45": {
++      "class_type": "ComfyMathExpression",
++      "inputs": {
++        "expression": "max(2, round(a / 24))",
++        "values.a": [
++          "44",
++          0
++        ]
++      },
++      "_meta": {
++        "title": "Interpolation Multiplier"
++      }
++    },
++    "46": {
++      "class_type": "ComfyMathExpression",
++      "inputs": {
++        "expression": "round(a / 24) >= 2",
++        "values.a": [
++          "44",
++          0
++        ]
++      },
++      "_meta": {
++        "title": "Interpolate?"
++      }
++    },
++    "47": {
++      "class_type": "ComfyMathExpression",
++      "inputs": {
++        "expression": "24 * max(1, round(a / 24))",
++        "values.a": [
++          "44",
++          0
++        ]
++      },
++      "_meta": {
++        "title": "Frame Rate (multiple of 24)"
++      }
++    },
++    "48": {
++      "class_type": "ComfySwitchNode",
++      "inputs": {
++        "switch": [
++          "46",
++          2
++        ],
++        "on_false": [
++          "43",
++          0
++        ],
++        "on_true": [
++          "30",
++          0
++        ]
++      },
++      "_meta": {
++        "title": "Interpolation On/Off"
++      }
++    },
++    "49": {
++      "class_type": "PrimitiveInt",
++      "inputs": {
++        "value": "{{width}}"
++      },
++      "_meta": {
++        "title": "Aspect Width"
++      }
++    },
++    "50": {
++      "class_type": "PrimitiveInt",
++      "inputs": {
++        "value": "{{height}}"
++      },
++      "_meta": {
++        "title": "Aspect Height"
++      }
++    },
++    "51": {
++      "class_type": "PrimitiveFloat",
++      "inputs": {
++        "value": "{{megapixels}}"
++      },
++      "_meta": {
++        "title": "Megapixels"
++      }
++    },
++    "52": {
++      "class_type": "ComfyMathExpression",
++      "inputs": {
++        "expression": "max(32, round(sqrt(c * 1048576 * a / b) / 32) * 32)",
++        "values.a": [
++          "49",
++          0
++        ],
++        "values.b": [
++          "50",
++          0
++        ],
++        "values.c": [
++          "51",
++          0
++        ]
++      },
++      "_meta": {
++        "title": "Video Width"
++      }
++    },
++    "53": {
++      "class_type": "ComfyMathExpression",
++      "inputs": {
++        "expression": "max(32, round(sqrt(c * 1048576 * b / a) / 32) * 32)",
++        "values.a": [
++          "49",
++          0
++        ],
++        "values.b": [
++          "50",
++          0
++        ],
++        "values.c": [
++          "51",
++          0
++        ]
++      },
++      "_meta": {
++        "title": "Video Height"
++      }
 +    }
++  },
++  "customFields": [
++    {
++      "id": "8d2cb79ae7db49f0dbeef73afe244daf",
++      "name": "Upscale",
++      "type": "BOOLEAN",
++      "default": "false",
++      "targets": [
++        {
++          "node": "43",
++          "input": "switch"
++        }
++      ]
++    },
++    {
++      "id": "beda1d82efae903f710709cbdb380c33",
++      "name": "Upscale model",
++      "type": "LIST",
++      "default": "4x-UltraSharp.pth",
++      "targets": [
++        {
++          "node": "40",
++          "input": "model_name"
++        }
++      ]
++    },
++    {
++      "id": "033cd2fd7b37ad429ee2b2bddbe25170",
++      "name": "Interpolation model",
++      "type": "LIST",
++      "default": "rife_v4.26.safetensors",
++      "targets": [
++        {
++          "node": "29",
++          "input": "model_name"
++        }
++      ]
++    }
++  ],
++  "fieldLabels": {
++    "frame_rate": "Frame rate (24 = no interpolation)",
++    "scale_by": "Scale after upscale",
++    "width": "Aspect width",
++    "height": "Aspect height"
 +  }
 +}
 \ No newline at end of file
 diff --git a/app/src/main/res/values-de/strings.xml b/app/src/main/res/values-de/strings.xml
-index c56bada..529df00 100644
+index c56bada..3e4a0c0 100644
 --- a/app/src/main/res/values-de/strings.xml
 +++ b/app/src/main/res/values-de/strings.xml
-@@ -1161,4 +1161,24 @@
+@@ -1161,4 +1161,25 @@
      <string name="sg_remove_output">Ausgang entfernen</string>
      <string name="sg_connect_hint_inputs">Tippe auf einen hervorgehobenen Ausgang oder eine Hinzufügen-Buchse</string>
      <string name="sg_connect_hint_outputs">Tippe auf einen hervorgehobenen Eingang oder eine Hinzufügen-Buchse</string>
@@ -2078,12 +2430,13 @@ index c56bada..529df00 100644
 +    <string name="content_description_remove_reference">Referenz entfernen</string>
 +    <string name="label_reference_video_sound">Ton</string>
 +    <string name="error_r2v_no_reference_node">Dieser Workflow hat keinen MiniMax-H3-Reference-to-Video-Knoten und kann keine Referenzen nutzen</string>
++    <string name="error_megapixels_range_h3">Muss zwischen 0,01 und 1,00 liegen (0,4 ist ausgewogen)</string>
  </resources>
 diff --git a/app/src/main/res/values-es/strings.xml b/app/src/main/res/values-es/strings.xml
-index 8156a16..e06bbfe 100644
+index 8156a16..33cc0f5 100644
 --- a/app/src/main/res/values-es/strings.xml
 +++ b/app/src/main/res/values-es/strings.xml
-@@ -1194,4 +1194,24 @@
+@@ -1194,4 +1194,25 @@
      <string name="sg_remove_output">Quitar salida</string>
      <string name="sg_connect_hint_inputs">Toca una salida resaltada o una toma «añadir»</string>
      <string name="sg_connect_hint_outputs">Toca una entrada resaltada o una toma «añadir»</string>
@@ -2107,12 +2460,13 @@ index 8156a16..e06bbfe 100644
 +    <string name="content_description_remove_reference">Quitar referencia</string>
 +    <string name="label_reference_video_sound">Sonido</string>
 +    <string name="error_r2v_no_reference_node">Este flujo de trabajo no tiene un nodo MiniMax H3 Reference to Video, así que no puede usar referencias</string>
++    <string name="error_megapixels_range_h3">Debe estar entre 0,01 y 1,00 (0,4 es equilibrado)</string>
  </resources>
 diff --git a/app/src/main/res/values-fr/strings.xml b/app/src/main/res/values-fr/strings.xml
-index 7ba9da1..fcad019 100644
+index 7ba9da1..3dfc64f 100644
 --- a/app/src/main/res/values-fr/strings.xml
 +++ b/app/src/main/res/values-fr/strings.xml
-@@ -1194,4 +1194,24 @@
+@@ -1194,4 +1194,25 @@
      <string name="sg_remove_output">Supprimer la sortie</string>
      <string name="sg_connect_hint_inputs">Touchez une sortie mise en évidence ou une prise « ajouter »</string>
      <string name="sg_connect_hint_outputs">Touchez une entrée mise en évidence ou une prise « ajouter »</string>
@@ -2136,12 +2490,13 @@ index 7ba9da1..fcad019 100644
 +    <string name="content_description_remove_reference">Retirer la référence</string>
 +    <string name="label_reference_video_sound">Son</string>
 +    <string name="error_r2v_no_reference_node">Ce workflow n\'a pas de nœud MiniMax H3 Reference to Video : il ne peut pas utiliser de références</string>
++    <string name="error_megapixels_range_h3">Doit être entre 0,01 et 1,00 (0,4 est équilibré)</string>
  </resources>
 diff --git a/app/src/main/res/values-pl/strings.xml b/app/src/main/res/values-pl/strings.xml
-index 007f98f..738697c 100644
+index 007f98f..29b91e0 100644
 --- a/app/src/main/res/values-pl/strings.xml
 +++ b/app/src/main/res/values-pl/strings.xml
-@@ -1225,4 +1225,24 @@
+@@ -1225,4 +1225,25 @@
      <string name="sg_remove_output">Usuń wyjście</string>
      <string name="sg_connect_hint_inputs">Dotknij podświetlonego wyjścia albo gniazda „dodaj”</string>
      <string name="sg_connect_hint_outputs">Dotknij podświetlonego wejścia albo gniazda „dodaj”</string>
@@ -2165,12 +2520,13 @@ index 007f98f..738697c 100644
 +    <string name="content_description_remove_reference">Usuń referencję</string>
 +    <string name="label_reference_video_sound">Dźwięk</string>
 +    <string name="error_r2v_no_reference_node">Ten workflow nie ma węzła MiniMax H3 Reference to Video, więc nie może użyć referencji</string>
++    <string name="error_megapixels_range_h3">Musi być od 0,01 do 1,00 (0,4 to wartość zrównoważona)</string>
  </resources>
 diff --git a/app/src/main/res/values-zh/strings.xml b/app/src/main/res/values-zh/strings.xml
-index 054ce22..29357b8 100644
+index 054ce22..5fa8afd 100644
 --- a/app/src/main/res/values-zh/strings.xml
 +++ b/app/src/main/res/values-zh/strings.xml
-@@ -1132,4 +1132,24 @@
+@@ -1132,4 +1132,25 @@
      <string name="sg_remove_output">移除输出</string>
      <string name="sg_connect_hint_inputs">点按高亮的输出或“添加”插口</string>
      <string name="sg_connect_hint_outputs">点按高亮的输入或“添加”插口</string>
@@ -2194,12 +2550,13 @@ index 054ce22..29357b8 100644
 +    <string name="content_description_remove_reference">移除参考</string>
 +    <string name="label_reference_video_sound">声音</string>
 +    <string name="error_r2v_no_reference_node">此工作流没有 MiniMax H3 Reference to Video 节点，无法使用参考</string>
++    <string name="error_megapixels_range_h3">必须在 0.01–1.00 之间（0.4 为均衡值）</string>
  </resources>
 diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
-index c681ba6..57016d3 100644
+index c681ba6..10d911b 100644
 --- a/app/src/main/res/values/strings.xml
 +++ b/app/src/main/res/values/strings.xml
-@@ -1193,4 +1193,24 @@
+@@ -1193,4 +1193,25 @@
      <string name="sg_remove_output">Remove output</string>
      <string name="sg_connect_hint_inputs">Tap a highlighted output or an add socket</string>
      <string name="sg_connect_hint_outputs">Tap a highlighted input or an add socket</string>
@@ -2223,4 +2580,5 @@ index c681ba6..57016d3 100644
 +    <string name="content_description_remove_reference">Remove reference</string>
 +    <string name="label_reference_video_sound">Sound</string>
 +    <string name="error_r2v_no_reference_node">This workflow has no MiniMax H3 Reference to Video node, so it can\'t use references</string>
++    <string name="error_megapixels_range_h3">Must be 0.01–1.00 (0.4 is balanced)</string>
  </resources>
