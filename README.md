@@ -1,48 +1,73 @@
 # ComfyChair (modded fork)
 
-Unofficial fork of [legal-hkr/comfychair](https://github.com/legal-hkr/comfychair) v0.9.6. All credit for the app goes to the original author. Every change lives in one file, `comfychair-relaxed-import-gguf.patch`, which is applied at build time.
+Forked from [legal-hkr/comfychair](https://github.com/legal-hkr/comfychair) v0.9.6. All credit for the app goes to the original author. Every change is in one file, `comfychair-relaxed-import-gguf.patch`, which is applied at build time.
 
-## What's different
+**My personal spin on ComfyChair: QoL tweaks and new features built around how I actually use it. The real credit goes to its developer. This app is a godsend.**
 
-### Reference to Video (new mode)
-A native **Refs** option on the Video tab, alongside Text, Image and Video, for MiniMax H3's reference-to-video model (ref2va).
+## Features
 
-- Add up to **9 images**, **3 videos** and **3 audio clips** as references, from your device.
-- Each reference shows its prompt tag: `<Picture N>`, `<Video N>` or `<Audio N>`. Tap one to put its tag in the prompt. MiniMax H3 ignores references that the prompt doesn't name.
-- A video's soundtrack can be kept or dropped. Kept soundtracks take `<Audio N>` numbers before standalone audio clips, matching how ComfyUI presents them to the model.
-- When you generate, references are uploaded and wired into the workflow's `MiniMaxH3ReferenceToVideo` node (ComfyUI core). This replaces whatever references the workflow came with.
-- Images are scaled down to a 2048 px short edge before upload, which is the most the model reads. Videos are trimmed to their first 15 seconds on the server.
-- Includes a bundled **MiniMax H3** Reference to Video workflow. Select the REF2VA diffusion model in it.
-- Imported workflows that contain `MiniMaxH3ReferenceToVideo` are detected as Reference to Video automatically. They also get their own filter and section on the Workflows page.
+### Reference to Video (MiniMax H3 ref2va)
+A new **Refs** option on the Video tab, beside Text, Image and Video.
+- Add up to **9 images**, **3 videos** and **3 audio clips** as references.
+- Each reference shows its prompt tag (`<Picture N>`, `<Video N>`, `<Audio N>`). Tap one to add its tag to the prompt. MiniMax H3 ignores references the prompt doesn't name.
+- A video's soundtrack can be kept or muted. Kept soundtracks are numbered as `<Audio N>` before standalone clips, the same order ComfyUI uses.
+- When you generate, the references are uploaded and wired into the workflow's `MiniMaxH3ReferenceToVideo` node (ComfyUI core).
+- Photos are scaled to a 2048 px short edge before upload, the most the model uses. Videos are trimmed to their first 15 seconds.
+- **Megapixels slider** (0.01–1.00, 0.4 balanced). Width and height set only the aspect ratio.
+- Comes with a bundled **MiniMax H3** workflow. Select the REF2VA diffusion model in it.
+
+### Upscale and frame interpolation
+These are settings in the bundled Reference to Video workflow and in the included Image to Video workflow.
+- **Frame rate:** MiniMax H3 renders at 24 fps. Setting 48 doubles it with frame interpolation, 72 triples it, and 24 turns interpolation off. Other values snap to a multiple of 24, so the sound stays in sync.
+- **Interpolation model:** a dropdown listing the files in `models/frame_interpolation` (RIFE or FILM). It uses ComfyUI core's `FrameInterpolate` node, not the RIFE VFI custom node.
+- **Upscale:** an on/off toggle plus an **Upscale model** dropdown listing `models/upscale_models` (e.g. 4x-UltraSharp). It's followed by **Scale after upscale** (0.5 after a 4x model = 2x overall).
+
+### ComfyUI server log
+Settings → Data → **ComfyUI server log** shows the server's console live: model loading, each sampling step with its progress bar, warnings and errors. You can follow, pause, filter, copy and share it.
+
+### Prompts
+- **History:** every prompt you submit is kept, from every screen (up to 200, newest first). You can search it, reuse a prompt, or remove one.
+- **MiniMax H3 prompt builder:**
+  - **References mode:** six sections (subjects, summary, retention, detailed description, soundscape, music).
+  - **Text/image mode:** description, soundscape and music.
+  - The builder assembles these into H3's structured prompt layout. If the current prompt already uses that layout, it opens with the sections filled in.
+- **Library import/export:** Settings → Backup → Prompt library. This moves all your saved prompts as one JSON file.
 
 ### Imports no longer blocked by missing nodes
-- Nodes your server doesn't have are removed, along with any inputs wired to them, and the rest of the workflow imports. Each removal is listed in the import notes.
-- The workflow editor can save a workflow that still contains missing nodes, so you can rebuild the gap in the app.
+- Nodes your server doesn't have are removed, along with any inputs wired to them. Each removal is listed in the import notes, and the workflow editor can save the result.
 - Workflows with subgraphs still use the original blocking dialog.
 
 ### GGUF support
-- Any `Unet*` loader (e.g. `UnetLoaderGGUF`) counts as a diffusion-model loader during type detection.
-- Model dropdowns on `UNETLoader` and the CLIP loaders also list GGUF files.
-- At submit, picking a `.gguf` file swaps the loader to its GGUF twin, and picking a non-GGUF file swaps it back. This covers `UNETLoader`, `CLIPLoader`, `DualCLIPLoader`, `TripleCLIPLoader` and `QuadrupleCLIPLoader`. The swap only happens if the twin node exists on your server (ComfyUI-GGUF).
+- `Unet*` loaders such as `UnetLoaderGGUF` are recognized when detecting the workflow type.
+- The UNET and CLIP model lists also include GGUF files.
+- When you submit, choosing a `.gguf` file switches the loader node to its GGUF version (UNET, CLIP, Dual/Triple/Quadruple CLIP), and choosing a regular file switches it back. This needs ComfyUI-GGUF on the server.
 
 ## Requirements
-- A ComfyUI version with the MiniMax H3 nodes, for Reference to Video
+- A ComfyUI version with the MiniMax H3, frame interpolation and logic (switch) nodes
+- Frame interpolation and upscale models in their model folders, if you use them
 - ComfyUI-GGUF, only for GGUF models
 
 ## Known limits
 - References aren't kept after the app restarts.
-- Some audio formats (e.g. `.ogg`/`.opus` voice messages) may be rejected by ComfyUI's `LoadAudio`. Use mp3 or wav if that happens.
-- Reference to Video drives the core ComfyUI node only, not custom director nodes (e.g. DaSiWa's MiniMaxH3Director).
+- Some audio formats (e.g. `.ogg`/`.opus` voice messages) may be rejected by ComfyUI. Use mp3 or wav instead.
+- Reference to Video works only with the core ComfyUI node, not with custom director nodes such as DaSiWa's.
 - At least one image or video reference is required. Audio alone won't generate.
+- The server log reads ComfyUI's `/internal/logs/raw` endpoint, which ComfyUI marks as internal to its own frontend. A future server update could change it.
+- Upscaling every frame with a 4x model needs a lot of memory.
 
 ## Status
-Experimental. The Reference to Video mode hasn't been confirmed by a successful build or a device test yet. The import and GGUF changes build successfully, but the GGUF CLIP-loader swap is still untested on a device.
+Experimental.
+- **Builds and runs:** the import and GGUF changes, and a first version of Reference to Video.
+- **Not yet confirmed in a build:** the slider, server log, prompt history, prompt builder and import/export.
 
 ## Install
-Run **Actions → Build modded APK → Run workflow**, then download the APK. The app ID is `sh.hnet.comfychair.mod`, so it installs alongside the original. It's signed with the debug key, so updates install over the previous mod build.
+1. Run **Actions → Build modded APK → Run workflow**.
+2. Download the APK from the run (or from Releases).
+
+The app ID is `sh.hnet.comfychair.mod`, so it installs alongside the original. It's signed with the debug key, so newer mod builds install over older ones.
 
 ## License
-Same as upstream (see `LICENSE`).
+Same as upstream (see `LICENSE`). 
 
 # <img src="metadata/en-US/icon.png" width="42"/> ComfyChair
 
