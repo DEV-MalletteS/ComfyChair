@@ -1,3 +1,27 @@
+# ComfyChair (modded fork)
+
+Unofficial fork of [legal-hkr/comfychair](https://github.com/legal-hkr/comfychair) v0.9.6. All credit for the app goes to the original author. Changes are in `comfychair-relaxed-import-gguf.patch`.
+
+## Changes
+
+- **Import with missing nodes:** nodes the server doesn't have are removed, along with any inputs wired to them, and the rest of the workflow imports. Each removal is listed in the import notes. Workflows with subgraphs still use the original blocking dialog.
+- **GGUF support:**
+  - Any `Unet*` loader (e.g. `UnetLoaderGGUF`) is recognised as a diffusion-model loader during type detection.
+  - Model dropdowns on `UNETLoader` and CLIP loaders also list GGUF files.
+  - At submit, a `.gguf` selection swaps the loader to its GGUF twin (`UNETLoader`, `CLIPLoader`, `DualCLIPLoader`, `TripleCLIPLoader`, `QuadrupleCLIPLoader`), and swaps back for other files. This only happens if the twin node exists on the server (ComfyUI-GGUF).
+
+## Status
+
+Untested. The patch was written from the source and has not been compiled or run on a device. The CLIP-loader swap in particular is unverified.
+
+## Install
+
+Run **Actions → Build modded APK → Run workflow**, then download the `comfychair-mod-apk` artifact. The app ID is `sh.hnet.comfychair.mod`, so it installs alongside the original. It is signed with the debug key.
+
+## License
+
+Same as upstream (see `LICENSE`).
+
 # <img src="metadata/en-US/icon.png" width="42"/> ComfyChair
 
 An unofficial, native Android UI for [ComfyUI](https://github.com/comfyanonymous/ComfyUI).
