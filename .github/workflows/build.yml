@@ -1,5 +1,7 @@
 name: Build modded APK
 on: workflow_dispatch
+permissions:
+  contents: write
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -19,7 +21,11 @@ jobs:
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-37" "build-tools;37.0.0" || true
       - name: Build
         run: chmod +x gradlew && ./gradlew assembleRelease --no-daemon
-      - uses: actions/upload-artifact@v4
+      - name: Rename APK
+        run: mv app/build/outputs/apk/release/*.apk ComfyChair-mod-${{ github.run_number }}.apk
+      - uses: softprops/action-gh-release@v2
         with:
-          name: comfychair-mod-apk
-          path: app/build/outputs/apk/release/*.apk
+          tag_name: mod-${{ github.run_number }}
+          name: ComfyChair mod build ${{ github.run_number }}
+          body: Unofficial modded build of legal-hkr/comfychair v0.9.6. See README for changes.
+          files: ComfyChair-mod-${{ github.run_number }}.apk
