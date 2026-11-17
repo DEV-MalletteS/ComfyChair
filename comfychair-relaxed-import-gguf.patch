@@ -1,0 +1,172 @@
+diff --git a/app/src/main/java/sh/hnet/comfychair/WorkflowManager.kt b/app/src/main/java/sh/hnet/comfychair/WorkflowManager.kt
+index 9c60053..3271c0c 100644
+--- a/app/src/main/java/sh/hnet/comfychair/WorkflowManager.kt
++++ b/app/src/main/java/sh/hnet/comfychair/WorkflowManager.kt
+@@ -624,10 +624,12 @@ object WorkflowManager {
+         val placeholder = "{{${TemplateKeyRegistry.getPlaceholderForKey(fieldKey)}}}"
+         val (classType, inputKey) = placeholderInputIndex(workflow.jsonContent)[placeholder] ?: return null
+         // Node definitions are looked up on each call: the registry may be loaded after the index was built
+-        return ConnectionManager.nodeTypeRegistry.getNodeDefinition(classType)
+-            ?.inputs
+-            ?.find { it.name == inputKey }
+-            ?.options
++        val registry = ConnectionManager.nodeTypeRegistry
++        val own = registry.getNodeDefinition(classType)?.inputs?.find { it.name == inputKey }?.options
++        // A loader and its GGUF twin both offered: the loader is swapped to match the file picked (see swapGgufLoaders)
++        val twin = GGUF_TWINS[classType] ?: GGUF_TWINS.entries.find { it.value == classType }?.key
++        val twinOptions = twin?.let { registry.getNodeDefinition(it)?.inputs?.find { i -> i.name == inputKey }?.options }
++        return if (own == null) null else (own + twinOptions.orEmpty()).distinct().sorted()
+     }
+ 
+     /** Placeholder index per workflow JSON; screens query it for many fields right after loading a workflow. */
+@@ -1841,9 +1843,56 @@ object WorkflowManager {
+         if (params.lownoiseLoraChain.isNotEmpty()) {
+             json = injectAdditionalVideoLoras(json, params.lownoiseLoraChain, isHighNoise = false)
+         }
++        json = swapGgufLoaders(json)
+         return json
+     }
+ 
++    /** Standard loader class <-> its ComfyUI-GGUF twin. */
++    private val GGUF_TWINS = mapOf(
++        "UNETLoader" to "UnetLoaderGGUF",
++        "CLIPLoader" to "CLIPLoaderGGUF",
++        "DualCLIPLoader" to "DualCLIPLoaderGGUF",
++        "TripleCLIPLoader" to "TripleCLIPLoaderGGUF",
++        "QuadrupleCLIPLoader" to "QuadrupleCLIPLoaderGGUF"
++    )
++    private val STANDARD_ONLY_INPUTS = listOf("weight_dtype", "device")
++
++    /**
++     * Make each model loader match the file picked in it: a .gguf in a standard loader turns it into its GGUF twin,
++     * a non-GGUF file in a GGUF loader turns it back. Swaps only when the target node exists on the server.
++     */
++    private fun swapGgufLoaders(processedJson: String): String {
++        if (!processedJson.contains("class_type")) return processedJson
++        return try {
++            val json = JSONObject(processedJson)
++            val nodes = json.optJSONObject("nodes") ?: json
++            val registry = ConnectionManager.nodeTypeRegistry
++            val reverse = GGUF_TWINS.entries.associate { it.value to it.key }
++            for (id in nodes.keys()) {
++                val node = nodes.optJSONObject(id) ?: continue
++                val inputs = node.optJSONObject("inputs") ?: continue
++                val cls = node.optString("class_type")
++                val fileKeys = inputs.keys().asSequence().filter { it == "unet_name" || it.startsWith("clip_name") }.toList()
++                val values = fileKeys.mapNotNull { inputs.optString(it, null) }.filter { it.isNotEmpty() && !it.startsWith("{{") }
++                if (values.isEmpty()) continue
++                val anyGguf = values.any { it.endsWith(".gguf", ignoreCase = true) }
++                val target = when {
++                    anyGguf && cls in GGUF_TWINS -> GGUF_TWINS.getValue(cls)
++                    !anyGguf && cls in reverse -> reverse.getValue(cls)
++                    else -> continue
++                }
++                if (registry.getNodeDefinition(target) == null) continue
++                node.put("class_type", target)
++                if (target in reverse) STANDARD_ONLY_INPUTS.forEach { inputs.remove(it) }
++                else if (target == "UNETLoader" && !inputs.has("weight_dtype")) inputs.put("weight_dtype", "default")
++                DebugLogger.i(TAG, "Loader swapped: $cls -> $target")
++            }
++            json.toString()
++        } catch (e: Exception) {
++            processedJson
++        }
++    }
++
+     /**
+      * Remove reference image nodes (LoadImage with a reference image placeholder) that got no image,
+      * together with the inputs connected to them, so the workflow runs without the optional references.
+diff --git a/app/src/main/java/sh/hnet/comfychair/util/WorkflowJsonAnalyzer.kt b/app/src/main/java/sh/hnet/comfychair/util/WorkflowJsonAnalyzer.kt
+index 598b047..666fe51 100644
+--- a/app/src/main/java/sh/hnet/comfychair/util/WorkflowJsonAnalyzer.kt
++++ b/app/src/main/java/sh/hnet/comfychair/util/WorkflowJsonAnalyzer.kt
+@@ -35,6 +35,35 @@ internal object WorkflowJsonAnalyzer {
+         "v2v_" to WorkflowType.V2V
+     )
+ 
++    /** A diffusion-model loader: ComfyUI's UNETLoader or any variant (UnetLoaderGGUF, UnetLoaderGGUFAdvanced, ...). */
++    fun isUnetLoader(classType: String): Boolean =
++        classType.equals("UNETLoader", ignoreCase = true) || classType.startsWith("UnetLoader", ignoreCase = true)
++
++    /**
++     * Remove every node whose class_type is in [classTypes], and every input wired to one of them.
++     * Returns null when the workflow has subgraph definitions (removal there is not supported).
++     */
++    fun removeNodes(jsonContent: String, classTypes: Set<String>): String? {
++        val root = JSONObject(jsonContent)
++        if (Subgraphs.definitionsOf(root) != null) return null
++        val nodes = root.optJSONObject("nodes") ?: root
++        val removed = mutableSetOf<String>()
++        for (id in nodes.keys().asSequence().toList()) {
++            val node = nodes.optJSONObject(id) ?: continue
++            if (node.optString("class_type") in classTypes) removed.add(id)
++        }
++        removed.forEach { nodes.remove(it) }
++        for (id in nodes.keys()) {
++            val inputs = nodes.optJSONObject(id)?.optJSONObject("inputs") ?: continue
++            val dangling = inputs.keys().asSequence().filter { key ->
++                val v = inputs.opt(key)
++                v is org.json.JSONArray && v.length() == 2 && v.optString(0) in removed
++            }.toList()
++            dangling.forEach { inputs.remove(it) }
++        }
++        return root.toString(2)
++    }
++
+     /** A node that loads a video file: ComfyUI's LoadVideo or VideoHelperSuite's VHS_LoadVideo (and its FFmpeg variant). */
+     fun isVideoLoader(classType: String): Boolean =
+         classType == "LoadVideo" || classType == "VHS_LoadVideo" || classType == "VHS_LoadVideoFFmpeg"
+@@ -139,7 +168,7 @@ internal object WorkflowJsonAnalyzer {
+ 
+         // Check for UNET loader
+         val hasUNETLoader = classTypes.any { classType ->
+-            classType.equals("UNETLoader", ignoreCase = true)
++            isUnetLoader(classType)
+         }
+ 
+         // Detection rules (order matters - most specific first):
+@@ -193,7 +222,7 @@ internal object WorkflowJsonAnalyzer {
+             it.contains("QwenImageEdit", ignoreCase = true)
+         }
+         val hasCheckpointLoader = classTypes.any { it.equals("CheckpointLoaderSimple", ignoreCase = true) }
+-        val hasUNETLoader = classTypes.any { it.equals("UNETLoader", ignoreCase = true) }
++        val hasUNETLoader = classTypes.any { isUnetLoader(it) }
+ 
+         return when {
+             // Video-to-video: loads a video (most specific: such workflows also have video nodes)
+diff --git a/app/src/main/java/sh/hnet/comfychair/viewmodel/WorkflowManagementViewModel.kt b/app/src/main/java/sh/hnet/comfychair/viewmodel/WorkflowManagementViewModel.kt
+index bdb7086..fcf8fb6 100644
+--- a/app/src/main/java/sh/hnet/comfychair/viewmodel/WorkflowManagementViewModel.kt
++++ b/app/src/main/java/sh/hnet/comfychair/viewmodel/WorkflowManagementViewModel.kt
+@@ -381,13 +381,26 @@ class WorkflowManagementViewModel : ViewModel() {
+                 // Validate nodes
+                 val missingNodes = WorkflowManager.validateNodesAgainstServer(workflowClassTypes, availableNodes)
+                 if (missingNodes.isNotEmpty()) {
+-                    DebugLogger.w(TAG, "Import blocked: ${missingNodes.size} missing nodes: ${missingNodes.joinToString()}")
++                    // Strip nodes the server lacks (and what was wired to them) and import the rest, so the editor can
++                    // rebuild the gap; blocked only when removal is unsupported (subgraphs)
++                    val stripped = try {
++                        WorkflowJsonAnalyzer.removeNodes(jsonContent, missingNodes.toSet())
++                    } catch (e: Exception) { null }
++                    if (stripped == null) {
++                        DebugLogger.w(TAG, "Import blocked: ${missingNodes.size} missing nodes: ${missingNodes.joinToString()}")
++                        _uiState.value = _uiState.value.copy(
++                            isValidatingNodes = false,
++                            showMissingNodesDialog = true,
++                            missingNodes = missingNodes
++                        )
++                        return@launch
++                    }
++                    DebugLogger.w(TAG, "Import: removed ${missingNodes.size} missing nodes: ${missingNodes.joinToString()}")
++                    jsonContent = stripped
+                     _uiState.value = _uiState.value.copy(
+-                        isValidatingNodes = false,
+-                        showMissingNodesDialog = true,
+-                        missingNodes = missingNodes
++                        pendingImportWarnings = _uiState.value.pendingImportWarnings +
++                            missingNodes.map { "Removed (not on server): $it" }
+                     )
+-                    return@launch
+                 }
+ 
+                 // Validate required fields for type
